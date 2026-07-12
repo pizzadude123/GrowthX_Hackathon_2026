@@ -1,0 +1,2 @@
+import React from 'react';import ReactDOM from 'react-dom/client';import {BrowserRouter} from 'react-router-dom';import {ConvexProvider,ConvexReactClient} from 'convex/react';import App from './App';import './styles.css';
+const url=import.meta.env.VITE_CONVEX_URL as string|undefined;const root=ReactDOM.createRoot(document.getElementById('root')!);root.render(<React.StrictMode><BrowserRouter>{url?<ConvexProvider client={new ConvexReactClient(url)}><App configured/></ConvexProvider>:<App configured={false}/>}</BrowserRouter></React.StrictMode>);

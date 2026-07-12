@@ -1,0 +1,11 @@
+node_modules/
+dist/
+coverage/
+.env
+.env.*
+!.env.example
+.convex/
+.wrangler/
+.DS_Store
+*.log
+whitebox-workspaces/
