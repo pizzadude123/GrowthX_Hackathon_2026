@@ -1,0 +1,20 @@
+{
+  "name": "whitebox-blocks",
+  "displayName": "Whitebox Blocks",
+  "description": "Render persisted Whitebox evidence on exact source ranges.",
+  "version": "0.1.0",
+  "publisher": "whitebox",
+  "engines": { "vscode": "^1.95.0" },
+  "main": "./dist/src/extension.js",
+  "activationEvents": ["onStartupFinished", "onCommand:whitebox.refresh"],
+  "contributes": {
+    "commands": [
+      { "command": "whitebox.refresh", "title": "Whitebox: Refresh Diagnostics" },
+      { "command": "whitebox.openDashboard", "title": "Whitebox: Open Live Dashboard" },
+      { "command": "whitebox.openFlow", "title": "Whitebox: Open Affected Flow" },
+      { "command": "whitebox.openEvidence", "title": "Whitebox: Open GitHub Evidence" },
+      { "command": "whitebox.requestRepair", "title": "Whitebox: Request Guarded Repair" }
+    ]
+  },
+  "devDependencies": { "@types/vscode": "^1.95.0" }
+}

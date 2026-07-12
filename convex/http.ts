@@ -1,0 +1,4 @@
+import { httpRouter } from 'convex/server'; import { httpAction } from './_generated/server'; import { api } from './_generated/api';
+const http=httpRouter();
+http.route({path:'/api/runs/start',method:'POST',handler:httpAction(async(ctx,request)=>{try{const body=await request.json() as {repoUrl?:string;goal?:string};if(!body.repoUrl)return new Response(JSON.stringify({error:'repoUrl is required'}),{status:400,headers:{'content-type':'application/json'}});const result=await ctx.runMutation(api.start.start,{repoUrl:body.repoUrl,goal:body.goal??'stabilize critical flows'});return new Response(JSON.stringify(result),{status:202,headers:{'content-type':'application/json','access-control-allow-origin':process.env.PUBLIC_APP_URL??''}});}catch(error){return new Response(JSON.stringify({error:error instanceof Error?error.message:'Invalid request'}),{status:400,headers:{'content-type':'application/json'}});}})});
+export default http;
