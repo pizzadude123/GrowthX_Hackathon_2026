@@ -21,5 +21,6 @@ export default defineSchema({
  roles:defineTable({name:v.string(),version:v.string(),enabled:v.boolean(),objective:v.string(),tools:v.array(v.string()),guardrails:v.array(v.string()),dynamic:v.boolean()}).index('by_name',['name']),
  evalCases:defineTable({caseId:v.string(),name:v.string(),version:v.string(),expected:v.any()}).index('by_case_id',['caseId']),
  evalRuns:defineTable({version:v.string(),startedAt:v.number(),completedAt:v.number(),passed:v.number(),failed:v.number(),data:v.any()}).index('by_version',['version']),
- managementActions:defineTable({runId:v.id('runs'),action:v.string(),actor:v.string(),createdAt:v.number(),details:v.optional(v.any())}).index('by_run',['runId'])
+ managementActions:defineTable({runId:v.id('runs'),action:v.string(),actor:v.string(),createdAt:v.number(),details:v.optional(v.any())}).index('by_run',['runId']),
+ waitlist:defineTable({email:v.string(),source:v.string(),joinedAt:v.number()}).index('by_email',['email']).index('by_joined_at',['joinedAt'])
 });

@@ -13,6 +13,7 @@ import type * as http from "../http.js";
 import type * as management from "../management.js";
 import type * as runs from "../runs.js";
 import type * as start from "../start.js";
+import type * as waitlist from "../waitlist.js";
 
 import type {
   ApiFromModules,
@@ -26,6 +27,7 @@ declare const fullApi: ApiFromModules<{
   management: typeof management;
   runs: typeof runs;
   start: typeof start;
+  waitlist: typeof waitlist;
 }>;
 
 /**

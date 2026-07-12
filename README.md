@@ -8,7 +8,8 @@ Whitebox is a Hermes-native Living Code Logistics Agency. It ingests a bounded p
 - Strict GitHub intake, public-repository limits, language/toolchain detection, fingerprints, graph nodes/edges, flows, state transitions, configuration contracts, exact evidence, dependency blast radius, snapshots, and incremental deltas.
 - Convex tables and live queries for runs, traces, schemas, principles, findings, repairs, validations, memory, diagnostics, roles, evals, and management actions.
 - Guarded deterministic repair recipes for configuration disagreement and missing fetch timeouts, each independently reversible and schema-validated.
-- React dashboard routes `/`, `/runs/:publicRunId`, and `/reports/:publicRunId`.
+- Convex-backed public waitlist at `/`; emails are normalized, deduplicated, and visible only through the authenticated Convex dashboard.
+- React dashboard routes `/dashboard`, `/runs/:publicRunId`, and `/reports/:publicRunId`.
 - Telegram-compatible command parser and canonical short reports.
 - Whitebox Blocks VS Code extension reading `whitebox/editor-diagnostics.json`.
 - Four named eval fixtures and CI quality gate.
