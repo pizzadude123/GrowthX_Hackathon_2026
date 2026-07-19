@@ -1,54 +1,92 @@
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
-import { createHash, randomUUID } from 'node:crypto';
-import { execFile } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { resolve } from 'node:path';
-import { promisify } from 'node:util';
 import { GitHubClient } from '../src/integrations/github/client.js';
-import { LinkupClient } from '../src/integrations/linkup/client.js';
+
 import { analyzeRepository } from '../packages/core/src/analyzer.js';
-import { proposeRepairs, validateRepairs } from '../packages/core/src/repairs.js';
-import { HermesRunsClient } from '../packages/core/src/hermes-client.js';
-import { sanitizeRelativePath } from '../packages/core/src/security.js';
+import { HermesRunCreationError, HermesRunsClient,type ProducerCreationEnvelope } from '../packages/core/src/hermes-client.js';
+import { assertIndependentHermesRuns } from '../packages/core/src/agent-telemetry.js';
 
-import { formatTelegramAgentUpdate, formatTelegramFinalResult, formatTelegramProgress } from '../packages/core/src/telegram-progress.js';
-import { createPdfReport } from '../packages/core/src/report-pdf.js';
-import { assertJobMayContinue, assertWorkerConfiguration, attemptArtifactPaths, canonicalResultSourceLabel, hermesTelegramTarget, isHermesRunTerminal, isHermesRunSuccessful, isTransientFailure, retryTransient } from '../packages/core/src/worker.js';
+
+import { assertJobMayContinue, assertWorkerConfiguration, attemptArtifactPaths, isHermesRunTerminal, isHermesRunSuccessful, isTransientFailure, retryTransient } from '../packages/core/src/worker.js';
 import { enforceAnalysisIntegrity } from '../packages/core/src/evidence-integrity.js';
-import { demoteUnverifiedAnalysis, mergeHermesVerifiedResult, parseHermesVerifiedResultText } from '../packages/core/src/hermes-result.js';
+import { mergeHermesVerifiedResult, parseHermesAuditorProposalText, parseHermesVerifiedResultText, reconcileHermesReview } from '../packages/core/src/hermes-result.js';
+import { hermesAuditorRunInput,hermesVerifierRunInput } from '../packages/core/src/hermes-authority.js';
+import { classifyDeliveryError } from '../packages/core/src/telegram-delivery.js';
+import {WHITEBOX_RELEASE_SOURCE_DIGEST} from '../packages/core/src/release-identity.js';
 
-type Job = { jobId: string; runId: string; publicId: string; repoUrl: string; repository: string; goal: string; mode: 'audit_only' | 'guarded_repair'; leaseId: string; telegramUserId?: string; telegramChatId?: string; telegramThreadId?: string };
+type JobBase = { runId:string; publicId:string; repository:string; mode:'audit_only'; leaseId:string };
+type AnalysisJob = JobBase & { kind:'analysis'; jobId:string; attemptId:string; repoUrl:string; requestedSourceCommitSha:string; goal:string; telegramUserId?:string; telegramChatId?:string; telegramThreadId?:string };
+type DeliveryJob = JobBase & { kind:'delivery'; outboxId:string; messageStatus:'pending'|'sending'|'delivered'|'unknown'; attachmentStatus:'pending'|'sending'|'delivered'|'unknown' };
+type Job = AnalysisJob | DeliveryJob;
 
 const config = assertWorkerConfiguration({
   controlPlaneUrl: process.env.WHITEBOX_CONTROL_PLANE_URL ?? '',
   workerToken: process.env.WHITEBOX_WORKER_TOKEN ?? '',
-  hermesKey: process.env.HERMES_SERVER_KEY ?? '',
+  hermesUrl:process.env.HERMES_SERVER_URL??'',
+  proxyToken: process.env.WHITEBOX_HERMES_PROXY_TOKEN ?? '',
 });
 const workerId = process.env.WHITEBOX_WORKER_ID ?? `whitebox-${process.pid}`;
-const github = new GitHubClient(process.env.GITHUB_TOKEN);
-const linkup = new LinkupClient(process.env.LINKUP_API_KEY);
-const hermes = new HermesRunsClient({ baseUrl: process.env.HERMES_SERVER_URL ?? 'http://127.0.0.1:8742', key: config.hermesKey, environment: 'production' });
-const systemPrompt = await readFile(resolve('hermes/WHITEBOX_POC_SYSTEM_PROMPT.md'), 'utf8');
-const execFileAsync = promisify(execFile);
-const hermesCli = process.env.HERMES_CLI ?? '/Users/pranay/.local/bin/hermes';
+const github = new GitHubClient(process.env.GITHUB_TOKEN ?? process.env.GH_TOKEN);
+
+const hermes = new HermesRunsClient({ baseUrl: config.hermesUrl, key: config.proxyToken, environment: 'production' });
+const auditorPrompt = await readFile(resolve('hermes/WHITEBOX_AUDITOR_SYSTEM_PROMPT.md'), 'utf8');
+const verifierPrompt = await readFile(resolve('hermes/WHITEBOX_POC_SYSTEM_PROMPT.md'), 'utf8');
+
+
+
+function analysisFailureClass(error: unknown) {
+  const message = error instanceof Error ? error.message.toLowerCase() : '';
+  if (message.includes('github rate limit') || message.includes('repository permission')) return 'source_access_denied';
+  if (message.includes('snapshot') || message.includes('source bytes') || message.includes('bound github blobs')) return 'source_binding_rejected';
+  if (message.includes('hermes') && message.includes('timeout')) return 'producer_timeout';
+  if (message.includes('strict proposal') || message.includes('strict signed result')) return 'producer_schema_rejected';
+  if (message.includes('receipt binding')) return 'receipt_binding_rejected';
+  if (message.includes('producer or runtime binding')) return 'runtime_binding_rejected';
+  if (message.includes('signed hermes envelopes')) return 'envelope_reconciliation_rejected';
+  if (message.includes('signed hermes result')) return 'envelope_merge_rejected';
+  if (message.includes('canonical evidence') || message.includes('canonical analysis') || message.includes('source metadata')) return 'canonical_integrity_rejected';
+  if (message.includes('failed to insert') || message.includes('does not match validator')) return 'persistence_schema_rejected';
+  if (message.includes('analysis snapshot') || message.includes('run record disappeared')) return 'canonical_persistence_rejected';
+  if (message.includes('/api/worker/complete')) {
+    const reason = message.match(/uncaught error: ([a-z0-9 _.-]{1,120})/)?.[1]?.trim().replace(/\s+/g, '_');
+    return reason ? `canonical_completion_rejected_${reason}` : 'canonical_completion_rejected';
+  }
+  if (message.includes('/api/worker/snapshot')) return 'snapshot_boundary_rejected';
+  return 'unclassified_failure';
+}
+
+async function assertHermesNoToolRuntime() {
+  const response=await fetch(`${config.hermesUrl}/whitebox/runtime`,{headers:{Authorization:`Bearer ${config.proxyToken}`},signal:AbortSignal.timeout(10_000)});
+  const payload=await response.json() as {receipt?:{runScopedGate?:unknown;signerAvailable?:unknown}};
+  if(!response.ok||payload.receipt?.runScopedGate!==true||payload.receipt.signerAvailable!==true)throw new Error('Dedicated Hermes run-scoped runtime gate is unavailable');
+}
 
 function dashboardUrl(job: Job) {
   return `${process.env.PUBLIC_APP_URL}/runs/${job.publicId}`;
 }
 
-async function telegramSend(job: Job, text: string) {
-  if (!job.telegramChatId) return;
-  await execFileAsync(hermesCli, ['--profile', 'whitebox', 'send', '--to', hermesTelegramTarget(job.telegramChatId, job.telegramThreadId), '--quiet', text], { timeout: 30_000, maxBuffer: 100_000 });
+
+
+async function signedDelivery(job:DeliveryJob,leg:'message'|'attachment'){
+  const response=await fetch(`${config.hermesUrl}/whitebox/deliver`,{method:'POST',headers:{Authorization:`Bearer ${config.proxyToken}`,'Content-Type':'application/json'},body:JSON.stringify({outboxId:job.outboxId,leaseId:job.leaseId,leg}),signal:AbortSignal.timeout(75_000)});
+  if(!response.ok)throw new Error(`Signed delivery failed (${response.status})`);
 }
 
-async function telegramUpdate(job: Job, text: string) {
-  await telegramSend(job, text).catch((error) => {
-    console.error(`${job.publicId}: Telegram update failed — ${error instanceof Error ? error.message : 'unknown error'}`);
-  });
-}
-
-async function telegramSendDocument(job: Job, path: string) {
-  if (!job.telegramChatId) return;
-  await execFileAsync(hermesCli, ['--profile', 'whitebox', 'send', '--to', hermesTelegramTarget(job.telegramChatId, job.telegramThreadId), '--quiet', `${job.publicId} · Full Whitebox evidence report\nMEDIA:${path}`], { timeout: 60_000, maxBuffer: 100_000 });
+async function deliverArtifacts(job: DeliveryJob) {
+  const heartbeat=setInterval(()=>{void control('/api/worker/heartbeat',{outboxId:job.outboxId,leaseId:job.leaseId}).catch(()=>undefined);},30_000);
+  try {
+    if(job.messageStatus==='pending'){
+      await signedDelivery(job,'message');
+    }
+    if(job.attachmentStatus==='pending'){
+      await signedDelivery(job,'attachment');
+    }
+  } catch {
+    console.error(`${job.publicId}: delivery attempt failed closed`);
+  } finally {
+    clearInterval(heartbeat);
+  }
 }
 
 async function control<T>(path: string, body: unknown, retry = true): Promise<T> {
@@ -64,37 +102,23 @@ async function control<T>(path: string, body: unknown, retry = true): Promise<T>
   return retry ? retryTransient(operation, { attempts: 3, baseDelayMs: 500 }) : operation();
 }
 
-async function awaitJobReady(job: Job) {
+async function awaitJobReady(job: AnalysisJob) {
   while (true) {
-    const state = await control<{ status: string; paused: boolean }>('/api/worker/state', { jobId: job.jobId, leaseId: job.leaseId });
+    const state = await control<{ status: string; paused: boolean }>('/api/worker/state', { jobId: job.jobId, attemptId: job.attemptId, leaseId: job.leaseId });
     const policy = assertJobMayContinue(state);
     if (!policy.paused) return;
     await new Promise((resolveDelay) => setTimeout(resolveDelay, 2_000));
   }
 }
 
-function schemaDocument(run: Job, analysis: Awaited<ReturnType<typeof analyzeRepository>>) {
-  const flows = analysis.flows.slice(0, 3).map((flow) => `- **${flow.name}** — ${flow.orderedNodeIds.join(' → ')}`).join('\n') || '- No complete high-confidence flow found.';
-  const findings = analysis.findings.filter((finding) => finding.status === 'confirmed').slice(0, 5).map((finding) => `- **${finding.severity.toUpperCase()} · ${finding.title}** — ${finding.evidence[0]?.path ?? 'evidence unavailable'}:${finding.evidence[0]?.startLine ?? 0}`).join('\n') || '- No confirmed findings.';
-  return `# Whitebox Living Code Logistics Schema\n\nRun: ${run.publicId}  \nRepository: ${run.repository}  \nGoal: ${run.goal}  \nMode: ${run.mode}  \nSnapshot: ${analysis.snapshot.id}\n\n## Capability profile\n\n${analysis.manifest.languages.map((language) => `- ${language.language}: ${language.percentage}%`).join('\n')}\n\n## High-value flows\n\n${flows}\n\n## Confirmed findings\n\n${findings}\n\n## Principles\n\n- Confirmed claims require exact repository evidence.\n- Repairs require independent validation and bounded blast radius.\n- Public repositories remain audit-only unless server-allowlisted.\n\nGenerated from repository evidence by Whitebox. The structured snapshot remains in Convex.\n`;
+
+async function loadVerifiedResult(hermesOutput?: string) {
+  const parsed = parseHermesVerifiedResultText(hermesOutput ?? '');
+  return { input: parsed.result, source: parsed.result ? 'Hermes final output' : undefined, errors: parsed.errors };
 }
 
-async function loadVerifiedResult(artifactDir: string, hermesOutput?: string) {
-  const artifactPath = resolve(artifactDir, 'verified-result.json');
-  try {
-    return { input: JSON.parse(await readFile(artifactPath, 'utf8')) as unknown, source: artifactPath, errors: [] as string[] };
-  } catch (error) {
-    const parsed = parseHermesVerifiedResultText(hermesOutput ?? '');
-    return {
-      input: parsed.result,
-      source: parsed.result ? 'Hermes final output' : undefined,
-      errors: parsed.result ? [] : [`verified-result.json unavailable: ${error instanceof Error ? error.message : String(error)}`, ...parsed.errors],
-    };
-  }
-}
-
-async function waitForHermes(job: Job, runId: string, onProgress: (elapsedMs: number) => Promise<void>) {
-  const timeoutMs = Number(process.env.WHITEBOX_HERMES_TIMEOUT_MS ?? 1_200_000);
+async function waitForHermes(job: AnalysisJob, runId: string, onProgress: (elapsedMs: number) => Promise<void>) {
+  const timeoutMs = Math.max(120_000, Math.floor(Number(process.env.WHITEBOX_HERMES_TIMEOUT_MS ?? 1_200_000) / 2));
   const startedAt = Date.now();
   const deadline = startedAt + timeoutMs;
   let polls = 0;
@@ -135,152 +159,101 @@ async function retryGateway<T>(operation: () => Promise<T>, attempts = 3): Promi
   throw new Error(`Hermes gateway unreachable after ${attempts} automatic attempts: ${lastError instanceof Error ? lastError.message : String(lastError)}`);
 }
 
-async function execute(job: Job) {
+async function execute(job: AnalysisJob) {
   const startedAt = Date.now();
   let activeHermesRunId: string | undefined;
   const heartbeat = setInterval(() => {
-    void control('/api/worker/heartbeat', { jobId: job.jobId, leaseId: job.leaseId }).catch((error) => {
+    void control('/api/worker/heartbeat', { jobId: job.jobId, attemptId: job.attemptId, leaseId: job.leaseId }).catch((error) => {
       console.error(`${job.publicId}: lease heartbeat failed — ${error instanceof Error ? error.message : 'unknown error'}`);
     });
   }, 30_000);
   try {
   await awaitJobReady(job);
-  const repository = await retryTransient(() => github.inspect(job.repoUrl), { attempts: 3, baseDelayMs: 750 });
-  await control('/api/worker/snapshot', {
-    jobId: job.jobId, leaseId: job.leaseId, repositoryKey: repository.key,
-    sourceCommitSha: repository.sourceSha,
+  if(!job.requestedSourceCommitSha)throw new Error('Server-resolved source commit is missing');
+  const repository = await retryTransient(() => github.inspect(job.repoUrl,job.requestedSourceCommitSha), { attempts: 3, baseDelayMs: 750 });
+  const sourceBinding=await control<{snapshotDigest:string;coverageDigest:string}>('/api/worker/snapshot', {
+    jobId: job.jobId, attemptId:job.attemptId, leaseId: job.leaseId, repositoryKey: repository.key,
+    sourceCommitSha: repository.sourceSha, snapshotFiles: repository.snapshotFiles,
   });
-  const { runDir, attemptDir } = attemptArtifactPaths(resolve('.whitebox-runs'), job.publicId, job.leaseId);
-  const snapshotDir = resolve(attemptDir, 'repository-snapshot');
-  for (const file of repository.files) {
-    const target = resolve(snapshotDir, sanitizeRelativePath(file.path));
-    await mkdir(resolve(target, '..'), { recursive: true });
-    await writeFile(target, file.content);
-  }
-  const hermesRun = await retryGateway(() => hermes.createRun({
-    input: `Execute read-only Whitebox POC run ${job.publicId}. Repository: ${repository.key}. Immutable source commit: ${repository.sourceSha}. User goal: ${job.goal}. The bounded snapshot is ${snapshotDir}. Write the strict final JSON artifact to ${resolve(attemptDir, 'verified-result.json')}. Follow the system instructions, use exact snapshot evidence, perform the minimal auditor-to-verifier workflow, and return the identical JSON object in a fenced json block.`,
-    sessionId: job.publicId,
-    instructions: systemPrompt,
-  }));
-  activeHermesRunId = hermesRun.runId;
+  const { attemptDir } = attemptArtifactPaths(resolve('.whitebox-runs'), job.publicId, job.leaseId);
+  const initialAnalysis = await analyzeRepository({ repositoryKey: repository.key, files: repository.files, goal:'audit_only', runId: job.publicId, dashboardUrl: dashboardUrl(job),sourceCommitSha:repository.sourceSha,coverageDigest:sourceBinding.coverageDigest });
+  const auditorInput = await hermesAuditorRunInput(job.publicId,repository.key,repository.sourceSha,sourceBinding.snapshotDigest,sourceBinding.coverageDigest,repository.files,initialAnalysis.findings);
+  if (Buffer.byteLength(auditorInput) > 320_000) throw new Error('Repository packet exceeds the isolated Hermes context boundary');
+
+  const auditorSessionId=`${job.publicId}-auditor-${job.attemptId}`;
+  const auditorAuthority=await control<ProducerCreationEnvelope>('/api/worker/producer-authority',{jobId:job.jobId,attemptId:job.attemptId,leaseId:job.leaseId,role:'auditor'});
+  const auditorRun = await hermes.createRun({
+    input: auditorInput,
+    sessionId: auditorSessionId,
+    instructions: auditorPrompt,
+    creationAuthority:auditorAuthority,
+  });
+  activeHermesRunId = auditorRun.runId;
   try {
-    await control('/api/worker/started', { jobId: job.jobId, leaseId: job.leaseId, hermesRunId: hermesRun.runId, hermesSessionId: job.publicId });
+    await control('/api/worker/started', { jobId: job.jobId, attemptId: job.attemptId, leaseId: job.leaseId, hermesRunId: auditorRun.runId, hermesSessionId: auditorSessionId });
   } catch (error) {
-    await hermes.stopRun(hermesRun.runId).catch(() => undefined);
+    await hermes.stopRun(auditorRun.runId).catch(() => undefined);
     throw error;
   }
-  await telegramUpdate(job, formatTelegramProgress({ publicId: job.publicId, repository: job.repository, stage: 'mapping', detail: 'Repository snapshot loaded. Hermes Manager is building the agency plan.' }));
-
-  const initialAnalysis = await analyzeRepository({ repositoryKey: repository.key, files: repository.files, goal: job.goal, runId: job.publicId, dashboardUrl: dashboardUrl(job) });
-  initialAnalysis.snapshot.sourceCommitSha = repository.sourceSha;
-  const confirmed = initialAnalysis.findings.filter((finding) => finding.status === 'confirmed').length;
-  await control('/api/worker/stage', { jobId: job.jobId, leaseId: job.leaseId, stage: 'auditing' });
-  await telegramUpdate(job, formatTelegramProgress({ publicId: job.publicId, repository: job.repository, stage: 'auditing', mappedFiles: initialAnalysis.manifest.files.length, flowCount: initialAnalysis.flows.length, findings: confirmed }));
-  const hermesResult = await waitForHermes(job, hermesRun.runId, async (elapsedMs) => {
-    await telegramUpdate(job, formatTelegramAgentUpdate({
-      publicId: job.publicId, repository: job.repository, elapsedMs,
-      commitSha: repository.sourceSha, languages: initialAnalysis.manifest.languages.map((item) => item.language),
-      mappedFiles: initialAnalysis.manifest.files.length, flowCount: initialAnalysis.flows.length,
-      confirmedFindings: confirmed, rejectedFindings: initialAnalysis.findings.filter((finding) => finding.status === 'rejected').length,
-      dependencies: initialAnalysis.dependencies.length, agents: [],
-    }));
-  });
-  activeHermesRunId = undefined;
-
-  if (!isHermesRunSuccessful(hermesResult.status)) throw new Error(`Hermes manager ended with ${hermesResult.status}: ${hermesResult.output?.slice(0, 300) ?? 'no output'}`);
-
-  if (process.env.LINKUP_API_KEY && initialAnalysis.dependencies[0]) {
-    try {
-      const lookup = await linkup.searchDocs(`${initialAnalysis.dependencies[0].packageName} current migration and deprecation documentation`);
-      initialAnalysis.dependencies[0] = { ...initialAnalysis.dependencies[0], evidenceSummary: `${initialAnalysis.dependencies[0].evidenceSummary} LinkUp: ${lookup.sourceSummary.slice(0, 400)}` };
-    } catch (error) {
-      initialAnalysis.dependencies[0] = { ...initialAnalysis.dependencies[0], evidenceSummary: `${initialAnalysis.dependencies[0].evidenceSummary} LinkUp unavailable: ${error instanceof Error ? error.message : 'unknown error'}` };
-    }
+  await control('/api/worker/stage', { jobId: job.jobId, attemptId: job.attemptId, leaseId: job.leaseId, stage: 'auditing' });
+  const auditorResult = await waitForHermes(job, auditorRun.runId, async () => undefined);
+  const auditorOutput = auditorResult.output;
+  if (!isHermesRunSuccessful(auditorResult.status) || !auditorOutput?.trim()) throw new Error(`Hermes Repository Auditor ended with ${auditorResult.status}`);
+  if (!auditorResult.receipt || !auditorResult.receiptSignature) throw new Error('Hermes Repository Auditor receipt is missing');
+  const parsedAuditor = parseHermesAuditorProposalText(auditorOutput);
+  if (!parsedAuditor.result || parsedAuditor.errors.length) throw new Error('Hermes Repository Auditor did not return a strict proposal envelope');
+  if (parsedAuditor.result.repository.toLowerCase() !== repository.key.toLowerCase() || parsedAuditor.result.sourceCommitSha.toLowerCase() !== repository.sourceSha.toLowerCase()) {
+    throw new Error('Hermes Repository Auditor proposal is not bound to the inspected repository snapshot');
   }
+
+
+  const verifierSessionId = `${job.publicId}-verifier-${job.attemptId}`;
+  const verifierAuthority=await control<ProducerCreationEnvelope>('/api/worker/producer-authority',{jobId:job.jobId,attemptId:job.attemptId,leaseId:job.leaseId,role:'verifier'});
+  const verifierRun = await hermes.createRun({
+    input: await hermesVerifierRunInput(job.publicId,repository.key,repository.sourceSha,sourceBinding.snapshotDigest,sourceBinding.coverageDigest,repository.files,parsedAuditor.result,initialAnalysis.findings),
+    sessionId: verifierSessionId,
+    instructions: verifierPrompt,
+    creationAuthority:verifierAuthority,
+  });
+  activeHermesRunId = verifierRun.runId;
+  await control('/api/worker/verifier-started', { jobId: job.jobId, attemptId: job.attemptId, leaseId: job.leaseId, hermesRunId: verifierRun.runId, hermesSessionId: verifierSessionId });
+  await control('/api/worker/stage', { jobId: job.jobId, attemptId: job.attemptId, leaseId: job.leaseId, stage: 'validating' });
+
+  const verifierResult = await waitForHermes(job, verifierRun.runId, async () => undefined);
+  if (!verifierResult.receipt || !verifierResult.receiptSignature) throw new Error('Hermes Verification Lead receipt is missing');
+  activeHermesRunId = undefined;
+  assertIndependentHermesRuns(auditorResult, verifierResult);
+  const hermesResult = verifierResult;
 
   let analysis = enforceAnalysisIntegrity(initialAnalysis, repository.files).analysis;
-  const verifiedResult = await loadVerifiedResult(attemptDir, hermesResult.output);
+  const verifiedResult = await loadVerifiedResult(hermesResult.output);
   const ingestionMessages: string[] = [...verifiedResult.errors];
-  let structuredResultAccepted = false;
-  if (verifiedResult.input) {
-    const merged = mergeHermesVerifiedResult(analysis, repository.files, verifiedResult.input);
-    ingestionMessages.push(...merged.errors);
-    if (merged.errors.length === 0) {
-      analysis = merged.analysis;
-      structuredResultAccepted = true;
-      ingestionMessages.push(`Hermes verified findings: ${merged.acceptedCount} accepted, ${merged.rejectedCount} rejected (${canonicalResultSourceLabel(verifiedResult.source)}).`);
-    } else {
-      analysis = demoteUnverifiedAnalysis(analysis, merged.errors.join('; '));
-    }
-  } else {
-    analysis = demoteUnverifiedAnalysis(analysis, 'Structured Hermes result was missing or malformed');
-    ingestionMessages.push('Run is partial: deterministic candidates remain human-review items because Hermes did not return a valid structured artifact.');
-  }
-  await mkdir(runDir, { recursive: true });
-  await writeFile(resolve(runDir, 'RESULT_INGESTION.json'), JSON.stringify({ state: structuredResultAccepted ? 'verified' : 'partial', messages: ingestionMessages }, null, 2));
-  if (job.mode === 'guarded_repair' && structuredResultAccepted) {
-    const proof = await validateRepairs(repository.key, repository.files, proposeRepairs(repository.files, analysis.findings));
-    analysis = enforceAnalysisIntegrity({ ...analysis, repairs: proof.repairs, validations: proof.validations }, repository.files).analysis;
-  }
-  await control('/api/worker/stage', { jobId: job.jobId, leaseId: job.leaseId, stage: 'validating' });
-  await telegramUpdate(job, formatTelegramProgress({ publicId: job.publicId, repository: job.repository, stage: 'validating', mappedFiles: analysis.manifest.files.length, flowCount: analysis.flows.length, findings: analysis.findings.filter((finding) => finding.status === 'confirmed').length }));
-  const document = schemaDocument(job, analysis);
-  await writeFile(resolve(runDir, 'WHITEBOX_LOGISTICS.md'), document);
-  await writeFile(resolve(runDir, 'living-code-logistics-schema.md'), document);
-  const persistedAnalysis = { ...analysis, snapshot: { ...analysis.snapshot, schemaDocument: document } };
-  const verified = persistedAnalysis.repairs.filter((repair) => repair.status === 'verified').length;
-  const reverted = persistedAnalysis.repairs.filter((repair) => repair.status === 'reverted').length;
-  const prUrl = undefined;
-  const agentSteps: Array<{ role: string; status: string }> = [];
-  const confirmedFindings = persistedAnalysis.findings.filter((finding) => finding.status === 'confirmed');
-  const evalChecks = [persistedAnalysis.manifest.files.length > 0, persistedAnalysis.flows.length > 0, isHermesRunSuccessful(hermesResult.status), structuredResultAccepted];
-  const finalMessage = formatTelegramFinalResult({
-    publicId: job.publicId, repository: job.repository, mode: job.mode, commitSha: repository.sourceSha,
-    elapsedMs: Date.now() - startedAt, mappedFiles: persistedAnalysis.manifest.files.length,
-    languages: persistedAnalysis.manifest.languages.map((item) => item.language), flows: persistedAnalysis.flows.map((flow) => flow.name),
-    rejectedFindings: persistedAnalysis.findings.filter((finding) => finding.status === 'rejected').length,
-    findings: confirmedFindings.map((finding) => ({ severity: finding.severity, title: finding.title, evidence: finding.evidence[0] ? `${finding.evidence[0].path}:${finding.evidence[0].startLine}-${finding.evidence[0].endLine}` : 'No exact source range persisted' })),
-    dependencies: persistedAnalysis.dependencies.map((dependency) => ({ packageName: dependency.packageName, classification: dependency.classification })),
-    agents: agentSteps.map((step) => ({ role: step.role, status: step.status })), evalPassed: evalChecks.filter(Boolean).length, evalTotal: evalChecks.length,
-    resultState: structuredResultAccepted ? 'verified' : 'partial',
-    dashboardUrl: dashboardUrl(job),
-    ...(prUrl ? { prUrl } : {}),
-  });
-  const pdfPath = resolve(runDir, `${job.publicId}-WHITEBOX-REPORT.pdf`);
-  const pdf = createPdfReport([...finalMessage.split('\n'), '', 'EDITOR DIAGNOSTICS', ...persistedAnalysis.editorDiagnostics.map((diagnostic) => `${diagnostic.severity.toUpperCase()} ${diagnostic.title} - ${diagnostic.path}:${diagnostic.startLine}-${diagnostic.endLine} - ${diagnostic.impact}`), '', 'LIVING CODE LOGISTICS SCHEMA', ...document.split('\n'), '', 'INGESTION RECEIPT', ...ingestionMessages]);
-  await writeFile(pdfPath, pdf);
-  const resultDigest = createHash('sha256').update(JSON.stringify(persistedAnalysis)).digest('hex');
+  if(!verifiedResult.input)throw new Error('Hermes verifier did not return a strict signed result');
+  const reconciled = reconcileHermesReview(parsedAuditor.result, verifiedResult.input);ingestionMessages.push(...reconciled.errors);if(!reconciled.result)throw new Error('Hermes signed envelopes do not reconcile');const merged=await mergeHermesVerifiedResult(analysis,repository.files,reconciled.result);if(merged.errors.length)throw new Error('Hermes signed result cannot be merged');analysis=merged.analysis;ingestionMessages.push(`Hermes verified findings: ${merged.acceptedCount} accepted, ${merged.rejectedCount} rejected.`);
+  analysis.snapshot.confidenceSummary = `${analysis.manifest.capability.deepSemantic ? 'Deep-semantic signals available' : 'Baseline analysis'}; ${analysis.findings.filter((finding) => finding.status === 'confirmed').length} confirmed findings.`;
+  await control('/api/worker/stage', { jobId: job.jobId, attemptId: job.attemptId, leaseId: job.leaseId, stage: 'validating' });
+
   await awaitJobReady(job);
-  await control('/api/worker/complete', {
+  const completion=await control<{completionDigest:string}>('/api/worker/complete', {
     jobId: job.jobId,
+    attemptId:job.attemptId,
     runId: job.runId,
     leaseId: job.leaseId,
     repositoryKey: repository.key,
     sourceCommitSha: repository.sourceSha,
-    hermesRunId: hermesRun.runId,
-    protocolVersion: 'whitebox-verified-result-v1',
-    resultDigest,
-    analysis: persistedAnalysis,
-    hermesStatus: hermesResult.status,
-    hermesOutputSummary: ingestionMessages.join('\n').slice(0, 2_000),
-    resultStatus: structuredResultAccepted ? (job.mode === 'audit_only' ? 'audit_only' : 'partial') : 'partial',
-    elapsedMs: Date.now() - startedAt,
-    verifiedRepairCount: verified,
-    revertedRepairCount: reverted,
-    prUrl,
-    agentSteps,
+    hermesRunId: auditorRun.runId,
+    hermesVerifierRunId: verifierRun.runId,
+    auditorProposal:parsedAuditor.result,
+    verifierResult:verifiedResult.input,
+    auditorReceipt:auditorResult.receipt,
+    auditorSignature:auditorResult.receiptSignature,
+    verifierReceipt:verifierResult.receipt,
+    verifierSignature:verifierResult.receiptSignature,
+    sourceFiles: repository.files,
+    releaseSourceDigest:WHITEBOX_RELEASE_SOURCE_DIGEST,
   });
-  if (job.telegramChatId) {
-    try {
-      const telegramMessageId = await retryTransient(() => telegramSend(job, finalMessage), { attempts: 3, baseDelayMs: 1_000 });
-      const pdfMessageId = await retryTransient(() => telegramSendDocument(job, pdfPath), { attempts: 3, baseDelayMs: 1_000 });
-      await control('/api/worker/delivery', { jobId: job.jobId, leaseId: job.leaseId, status: 'delivered', telegramMessageId, pdfMessageId });
-    } catch (error) {
-      const deliveryError = error instanceof Error ? error.message : 'Telegram delivery failed';
-      await control('/api/worker/delivery', { jobId: job.jobId, leaseId: job.leaseId, status: 'failed', error: deliveryError.slice(0, 500) }).catch(() => undefined);
-      console.error(`${job.publicId}: terminal delivery failed — ${deliveryError}`);
-    }
-  }
+  await mkdir(attemptDir,{recursive:true});
+  await writeFile(resolve(attemptDir,'RESULT_INGESTION.json'),JSON.stringify({state:'completed',attemptId:job.attemptId,completionDigest:completion.completionDigest,messages:ingestionMessages},null,2));
   console.log(`${job.publicId}: ${isHermesRunSuccessful(hermesResult.status) ? 'completed' : hermesResult.status} (${Date.now() - startedAt}ms)`);
   } finally {
     if (activeHermesRunId) await hermes.stopRun(activeHermesRunId).catch(() => undefined);
@@ -289,6 +262,7 @@ async function execute(job: Job) {
 }
 
 async function main() {
+  await assertHermesNoToolRuntime();
   console.log(`Whitebox worker ${workerId} connected to ${config.controlPlaneUrl}`);
   while (true) {
     const leaseId = randomUUID();
@@ -306,23 +280,30 @@ async function main() {
       continue;
     }
     try {
-      await execute(job);
+      if (job.kind === 'delivery') {
+        await deliverArtifacts(job);
+      } else {
+        await execute(job);
+      }
     } catch (error) {
-      const message = error instanceof Error ? error.message : 'Unknown worker failure';
-      const cancelled = /\b(?:cancelled|canceled)\b/i.test(message);
+      if (job.kind === 'delivery') {
+        await control('/api/worker/delivery-fail', { outboxId:job.outboxId, leaseId:job.leaseId, code:classifyDeliveryError(error) }).catch(() => undefined);
+        console.error(`${job.publicId}: delivery recovery failed closed`);
+        continue;
+      }
+      const current=await control<{status:string}>('/api/worker/state',{jobId:job.jobId,attemptId:job.attemptId,leaseId:job.leaseId},false).catch(()=>({status:'unknown'}));
+      const cancelled=current.status==='cancelled';
       let terminal = true;
       if (cancelled) {
-        await control('/api/worker/abort', { jobId: job.jobId, leaseId: job.leaseId, reason: message.slice(0, 1_000) }).catch(() => undefined);
+        await control('/api/worker/abort', { jobId:job.jobId,attemptId:job.attemptId,leaseId:job.leaseId,code:'cancelled' }).catch(() => undefined);
       } else {
-        const failure = await control<{ terminal: boolean }>('/api/worker/fail', { jobId: job.jobId, leaseId: job.leaseId, error: message.slice(0, 1_000), retryable: isTransientFailure(error) }).catch((controlError) => {
-          console.error(`${job.publicId}: unable to persist failure — ${controlError instanceof Error ? controlError.message : String(controlError)}`);
+        const failure = await control<{ terminal: boolean }>('/api/worker/fail', { jobId:job.jobId,attemptId:job.attemptId,leaseId:job.leaseId,code:classifyDeliveryError(error),retryable:!(error instanceof HermesRunCreationError)&&isTransientFailure(error) }).catch(() => {
+          console.error(`${job.publicId}: unable to persist bounded failure`);
           return { terminal: true };
         });
         terminal = failure.terminal;
       }
-      const detail = message.toLowerCase().includes('fetch') ? 'A required service was unavailable after bounded retries.' : message;
-      await telegramUpdate(job, formatTelegramProgress({ publicId: job.publicId, repository: job.repository, stage: cancelled ? 'cancelled' : terminal ? 'blocked' : 'retrying', detail: detail.slice(0, 220), dashboardUrl: dashboardUrl(job) }));
-      console.error(`${job.publicId}: ${cancelled ? 'cancelled' : terminal ? 'blocked' : 'retry queued'} — ${message}`);
+      console.error(`${job.publicId}: ${cancelled?'cancelled':terminal?'blocked':'retry queued'} with redacted ${analysisFailureClass(error)}`);
     }
     if (process.argv.includes('--once')) return;
   }

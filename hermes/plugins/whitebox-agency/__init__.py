@@ -18,6 +18,8 @@ def _control_sync(path: str, body: dict[str, Any]) -> dict[str, Any]:
     token = os.environ.get("WHITEBOX_COMMAND_TOKEN", "")
     if not base or len(token) < 32:
         raise RuntimeError("Whitebox control plane is not configured")
+    if urllib.parse.urlparse(base).scheme != "https":
+        raise RuntimeError("Whitebox control plane requires HTTPS")
     request = urllib.request.Request(
         f"{base}{path}",
         data=json.dumps(body).encode(),
@@ -106,8 +108,17 @@ async def _start(raw: str, event: Any = None) -> str:
     try:
         repo, goal = _parse_start(raw)
         result = await _control("/api/runs/start", {"repoUrl": repo, "goal": goal, **_identity(event)})
-        mode = "Guarded repair" if result["mode"] == "guarded_repair" else "Audit only"
-        return f"🧭 {result['publicId']} · Accepted\n\nRepo: {result['repository']}\nMode: {mode}\nGoal: {goal}\n\nI’ll send mapping, audit, validation, and final updates here automatically.\nDashboard: {result['dashboardUrl']}"
+        mode = "Audit only"
+        return (
+            f"🧭 {result['publicId']} · Accepted\n\n"
+            f"Repo: {result['repository']}\nMode: {mode}\nGoal: {goal}\n\n"
+            "I’ll send the final audit and PDF here automatically.\n\n"
+            "Next commands:\n"
+            f"• /whitebox-status {result['publicId']}\n"
+            f"• /findings {result['publicId']}\n"
+            f"• /whitebox-next {result['publicId']}\n\n"
+            f"Dashboard: {result['dashboardUrl']}"
+        )
     except Exception as error:
         return f"⚠️ Whitebox could not accept this run\n\n{error}"
 
@@ -119,9 +130,8 @@ async def _load(raw: str, event: Any = None) -> dict[str, Any]:
 async def _status(raw: str, event: Any = None) -> str:
     try:
         data = await _load(raw, event); run = data["run"]
-        counts = f"Files: {run['mappedFiles']} · Flows: {run['flowCount']} · Findings: {run['confirmedFindingCount']} · Fixed: {run['verifiedRepairCount']}"
-        error = f"\nBlocked: {run['error']}" if run.get("error") else ""
-        return f"🧭 {run['publicId']} · {run['currentStage']}\n\nRepo: {run['repository']}\n{counts}{error}\n\nDashboard:\n{os.environ.get('PUBLIC_APP_URL','')}/runs/{run['publicId']}"
+        counts = f"Files: {run['mappedFiles']} · Flows: {run['flowCount']} · Confirmed: {run['confirmedFindingCount']} · Rejected: {run['rejectedFindingCount']}"
+        return f"🧭 {run['publicId']} · {run['currentStage']}\n\nRepo: {run['repository']}\n{counts}\nDelivery: {run.get('deliveryStatus', 'pending')}\nMode: audit only\n\nDashboard:\n{os.environ.get('PUBLIC_APP_URL','')}/runs/{run['publicId']}"
     except Exception as error:
         return f"⚠️ Status unavailable: {error}"
 
@@ -130,18 +140,10 @@ async def _findings(raw: str, event: Any = None) -> str:
     try:
         data = await _load(raw, event); rows = [row for row in data.get("findings", []) if row.get("status") in {"confirmed", "probable"}][:4]
         body = "\n".join(f"• {row['severity'].upper()} · {row['title']}" for row in rows) or "No active verified findings yet."
-        return f"🔎 {data['run']['publicId']} · Findings\n\n{body}\n\nDashboard: {os.environ.get('PUBLIC_APP_URL','')}/runs/{data['run']['publicId']}"
+        return f"🔎 {data['run']['publicId']} · Findings\n\n{body}\n\nRemediation guidance: /whitebox-next {data['run']['publicId']}\nDashboard: {os.environ.get('PUBLIC_APP_URL','')}/runs/{data['run']['publicId']}"
     except Exception as error:
         return f"⚠️ Findings unavailable: {error}"
 
-
-async def _repairs(raw: str, event: Any = None) -> str:
-    try:
-        data = await _load(raw, event); rows = data.get("repairs", [])[:4]
-        body = "\n".join(f"• {row['status']} · {row['data']['title']}" for row in rows) or "No repair decision yet."
-        return f"🛠️ {data['run']['publicId']} · Repairs\n\n{body}\n\nDashboard: {os.environ.get('PUBLIC_APP_URL','')}/runs/{data['run']['publicId']}"
-    except Exception as error:
-        return f"⚠️ Repairs unavailable: {error}"
 
 
 async def _dependencies(raw: str, event: Any = None) -> str:
@@ -196,16 +198,61 @@ async def _cancel(raw: str, event: Any = None) -> str:
     return await _action(raw, "cancel", event)
 
 
-def _help(_: str) -> str:
-    return "Whitebox commands\n\n/whitebox OWNER/REPO --goal \"...\"\n/whitebox-status RUN-ID\n/findings RUN-ID\n/repairs RUN-ID\n/dependencies RUN-ID\n/memory OWNER/REPO\n/whitebox-open RUN-ID\n/whitebox-pause RUN-ID\n/whitebox-resume RUN-ID\n/whitebox-cancel RUN-ID"
+def _guide(_: str) -> str:
+    return (
+        "🧭 Whitebox quick start\n\n"
+        "1. Start a read-only audit\n"
+        "/whitebox OWNER/REPO --goal \"review critical flows\"\n\n"
+        "2. Track and inspect it\n"
+        "/whitebox-status RUN-ID\n"
+        "/findings RUN-ID\n"
+        "/dependencies RUN-ID\n"
+        "/whitebox-open RUN-ID\n\n"
+        "3. Remediate verified issues\n"
+        "/whitebox-next RUN-ID\n\n"
+        "Whitebox does not edit repositories, execute submitted code, or open PRs. "
+        "Use its exact evidence and recommendations in your own coding workspace, test the change, then Run Whitebox again to audit the new commit.\n\n"
+        "Other commands\n"
+        "/memory OWNER/REPO\n"
+        "/whitebox-pause RUN-ID\n"
+        "/whitebox-resume RUN-ID\n"
+        "/whitebox-cancel RUN-ID"
+    )
 
 
-def register(ctx) -> None:
+def _help(raw: str) -> str:
+    return _guide(raw)
+
+
+async def _next_steps(raw: str, event: Any = None) -> str:
+    try:
+        data = await _load(raw, event)
+        run = data["run"]
+        rows = [row for row in data.get("findings", []) if row.get("status") in {"confirmed", "needs_human_review"}][:4]
+        recommendations = "\n".join(
+            f"• {row['severity'].upper()} · {row['title']}\n  Next action: {row['recommendation']}"
+            for row in rows
+        ) or "No active verified finding needs remediation."
+        rerun = f'/whitebox {run["repository"]} --goal "verify the remediation from {run["publicId"]}"'
+        return (
+            f"🛠 {run['publicId']} · Remediation handoff\n\n"
+            "Whitebox does not edit repositories or publish pull requests. Apply these advisory actions with a developer or coding agent in your own trusted workspace:\n\n"
+            f"{recommendations}\n\n"
+            "After changing and testing the repository, push the new commit and Run Whitebox again:\n"
+            f"{rerun}\n\n"
+            f"Evidence: {os.environ.get('PUBLIC_APP_URL','')}/runs/{run['publicId']}"
+        )
+    except Exception as error:
+        return f"⚠️ Remediation guidance unavailable: {error}"
+
+
+def register(ctx: Any) -> None:
     commands = [
         ("whitebox", _start, "Start a Whitebox repository run", '<repo-url> --goal "..."'),
+        ("whitebox-guide", _guide, "Show the Whitebox audit and remediation workflow", ""),
         ("whitebox-status", _status, "Show live Whitebox run status", "<run-id>"),
         ("findings", _findings, "Show verified findings", "<run-id>"),
-        ("repairs", _repairs, "Show repair outcomes", "<run-id>"),
+        ("whitebox-next", _next_steps, "Show advisory remediation steps and re-audit command", "<run-id>"),
         ("dependencies", _dependencies, "Show dependency risks", "<run-id>"),
         ("memory", _memory, "Show the latest repository memory", "<owner/repo>"),
         ("whitebox-open", _open, "Open a live Whitebox run", "<run-id>"),

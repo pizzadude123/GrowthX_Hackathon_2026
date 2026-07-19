@@ -9,8 +9,13 @@
  */
 
 import type * as http from "../http.js";
+import type * as lib_attempt_lifecycle from "../lib/attempt_lifecycle.js";
 import type * as lib_completion_binding from "../lib/completion_binding.js";
+import type * as lib_delivery_lifecycle from "../lib/delivery_lifecycle.js";
+import type * as lib_github_snapshot from "../lib/github_snapshot.js";
 import type * as lib_persist_analysis from "../lib/persist_analysis.js";
+import type * as lib_producer_authority from "../lib/producer_authority.js";
+import type * as lib_public_run from "../lib/public_run.js";
 import type * as lib_token_scope from "../lib/token_scope.js";
 import type * as management from "../management.js";
 import type * as runs from "../runs.js";
@@ -26,8 +31,13 @@ import type {
 
 declare const fullApi: ApiFromModules<{
   http: typeof http;
+  "lib/attempt_lifecycle": typeof lib_attempt_lifecycle;
   "lib/completion_binding": typeof lib_completion_binding;
+  "lib/delivery_lifecycle": typeof lib_delivery_lifecycle;
+  "lib/github_snapshot": typeof lib_github_snapshot;
   "lib/persist_analysis": typeof lib_persist_analysis;
+  "lib/producer_authority": typeof lib_producer_authority;
+  "lib/public_run": typeof lib_public_run;
   "lib/token_scope": typeof lib_token_scope;
   management: typeof management;
   runs: typeof runs;

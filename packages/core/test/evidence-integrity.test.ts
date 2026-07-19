@@ -41,7 +41,7 @@ describe('repository evidence integrity', () => {
     expect(result.analysis.editorDiagnostics.length).toBeGreaterThan(0);
   });
 
-  it('rejects tampered confirmed findings and removes their active diagnostics and repairs', async () => {
+  it('rejects tampered confirmed findings and removes their active diagnostics', async () => {
     const analysis = await fixture();
     const real = analysis.findings.find((finding) => finding.status === 'confirmed');
     expect(real).toBeDefined();
@@ -61,12 +61,7 @@ describe('repository evidence integrity', () => {
         id: 'diagnostic-tampered', runId: 'WB-TEST', findingId: tampered.id,
         path: 'does/not/exist.ts', startLine: 999, endLine: 999, severity: 'error' as const,
         title: tampered.title, flowLabel: 'missing', principleStatement: 'missing', impact: tampered.impact,
-        repairStatus: 'proposed' as const, dashboardUrl: '/runs/WB-TEST',
-      }],
-      repairs: [{
-        id: 'repair-tampered', findingId: tampered.id, title: 'Unsafe repair', status: 'proposed' as const,
-        intendedInvariant: 'missing', affectedFlowIds: ['missing-flow'], predictedBlastRadius: 'unknown',
-        changedFiles: ['does/not/exist.ts'], changedLineCount: 1, patch: 'invented', validationPlan: ['invariant'], rollbackCondition: 'failure',
+        dashboardUrl: '/runs/WB-TEST',
       }],
     };
     const result = enforceAnalysisIntegrity(input, files);
@@ -75,18 +70,18 @@ describe('repository evidence integrity', () => {
     expect(rejected?.status).toBe('rejected');
     expect(rejected?.rejectionReason).toContain('Evidence integrity failed');
     expect(result.analysis.editorDiagnostics.some((item) => item.findingId === tampered.id)).toBe(false);
-    expect(result.analysis.repairs.some((item) => item.findingId === tampered.id)).toBe(false);
+
   });
 
-  it('keeps source-backed findings when no repository flow or invariant applies', async () => {
+  it('rejects source-backed findings that omit meaningful flow and invariant linkage', async () => {
     const analysis = await fixture();
     const real = analysis.findings.find((finding) => finding.status === 'confirmed');
     expect(real).toBeDefined();
     if (!real) return;
     const sourceBacked = { ...real, id: 'finding-source-backed', affectedFlowIds: [], violatedInvariantIds: [] };
     const result = enforceAnalysisIntegrity({ ...analysis, findings: [...analysis.findings, sourceBacked] }, files);
-    expect(result.rejectedFindingIds).not.toContain(sourceBacked.id);
-    expect(result.analysis.findings.find((finding) => finding.id === sourceBacked.id)?.status).toBe('confirmed');
+    expect(result.rejectedFindingIds).toContain(sourceBacked.id);
+    expect(result.analysis.findings.find((finding) => finding.id === sourceBacked.id)?.status).toBe('rejected');
   });
 
   it('rejects confirmed findings that omit graph-node linkage', async () => {

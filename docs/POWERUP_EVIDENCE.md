@@ -1,8 +1,10 @@
-# Partner Evidence
+# Optional integration evidence
 
-- **Cloudflare:** capture the deployed `.pages.dev` dashboard and Pages deployment receipt.
-- **Convex:** show the live `runs`, `agentSteps`, `schemaSnapshots`, `findings`, `repairs`, and `validations` records changing without refresh.
-- **LinkUp:** run one dependency/API documentation query, retain its query, timestamp, sources, trace step, and the decision it changed.
-- **Wispr Flow:** dictate at least 500 words during the event and retain the required stats screenshot.
+Optional integrations do not satisfy release gates by themselves.
 
-Dodo and ElevenLabs remain stretch work until the root loop is live and repeatable.
+- **Cloudflare:** retain the exact deployment receipt for the public dashboard build.
+- **Convex:** retain private records for the fresh accepted audit, immutable source attempt, canonical snapshot, and destination-bound delivery outbox.
+- **Hermes:** retain signed runtime and terminal receipts for both isolated zero-tool roles.
+- **Telegram:** retain signed message and PDF delivery receipts with the intended destination and positive platform message IDs.
+
+Do not present planned integrations, shared logs, stale records, screenshots, repair records, pull requests, or generated fixture data as current-run proof.

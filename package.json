@@ -10,13 +10,16 @@
     "dev": "vite --config apps/web/vite.config.ts",
     "build": "tsc -b && vite build --config apps/web/vite.config.ts",
     "preview": "vite preview --config apps/web/vite.config.ts",
-    "typecheck": "tsc -b --pretty false",
+    "typecheck": "tsc -b --pretty false && tsc -p convex/tsconfig.json --pretty false && tsc -p scripts/tsconfig.json --pretty false",
     "lint": "eslint . --max-warnings=0",
-    "test": "vitest run",
+    "test": "vitest run && python3 -m unittest discover -s hermes/plugins/whitebox-agency -p 'test_*.py' && python3 -m unittest discover -s hermes/runtime -p 'test_*.py'",
     "test:watch": "vitest",
     "eval": "tsx scripts/run-evals.ts",
     "verify:production": "tsx scripts/verify-production.ts",
+    "release:identity": "tsx scripts/generate-release-identity.ts",
+    "verify:security-contracts": "tsx scripts/verify-security-contracts.ts",
     "secret-scan": "tsx scripts/secret-scan.ts",
+    "receipt-proxy": "tsx scripts/hermes-receipt-proxy.ts",
     "worker": "tsx scripts/whitebox-worker.ts"
   },
   "dependencies": {

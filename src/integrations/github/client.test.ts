@@ -5,7 +5,7 @@ function response(body: unknown, status = 200) {
   return new Response(typeof body === 'string' ? body : JSON.stringify(body), { status, headers: { 'content-type': 'application/json' } });
 }
 
-function mockGitHub(privateRepo = false, truncated = false, extraSourceFiles = 0) {
+function mockGitHub(privateRepo = false, truncated = false, extraSourceFiles = 0, oversizedSource = false) {
   const calls: string[] = [];
   const extraTree = Array.from({ length: extraSourceFiles }, (_, index) => ({ path: `src/extra-${index}.ts`, type: 'blob', size: 20, url: `https://api.github.com/blobs/extra-${index}` }));
   const fetcher = async (input: RequestInfo | URL) => {
@@ -13,15 +13,17 @@ function mockGitHub(privateRepo = false, truncated = false, extraSourceFiles = 0
     calls.push(url);
     if (url.endsWith('/repos/acme/demo')) return response({ default_branch: 'main', size: 42, private: privateRepo });
     if (url.endsWith('/repos/acme/demo/branches/main')) return response({ commit: { sha: '0123456789abcdef0123456789abcdef01234567' } });
-    if (url.includes('/git/trees/0123456789')) return response({ sha: 'tree-sha', truncated, tree: [
+    if(url.endsWith('/git/commits/0123456789abcdef0123456789abcdef01234567'))return response({sha:'0123456789abcdef0123456789abcdef01234567',tree:{sha:'abcdefabcdefabcdefabcdefabcdefabcdefabcd'}});
+    if (url.includes('/git/trees/abcdefabcdef')) return response({ sha: 'tree-sha', truncated, tree: [
       { path: 'docs/guide.md', type: 'blob', size: 20, url: 'https://api.github.com/blobs/docs' },
       { path: 'src/main.vue', type: 'blob', size: 20, url: 'https://api.github.com/blobs/main' },
       { path: 'db/schema.sql', type: 'blob', size: 20, url: 'https://api.github.com/blobs/sql' },
       { path: 'scripts/deploy.sh', type: 'blob', size: 20, url: 'https://api.github.com/blobs/sh' },
       { path: 'package.json', type: 'blob', size: 20, url: 'https://api.github.com/blobs/package' },
       { path: 'node_modules/noise.js', type: 'blob', size: 20, url: 'https://api.github.com/blobs/noise' },
+      ...(oversizedSource ? [{ path: 'src/huge.ts', type: 'blob', size: 200_000, url: 'https://api.github.com/blobs/huge' }] : []),
       ...extraTree,
-    ] });
+    ].map((item, index) => ({ ...item, sha: (index + 1).toString(16).padStart(40, '0') })) });
     const path = url.includes('/blobs/') ? url.split('/blobs/')[1] : url.split('/0123456789abcdef0123456789abcdef01234567/')[1];
     const contents: Record<string, string> = {
       package: '{"scripts":{"test":"vitest"}}',
@@ -49,7 +51,8 @@ describe('GitHub repository inspection', () => {
     expect(repository.sourceSha).toBe('0123456789abcdef0123456789abcdef01234567');
     expect(repository.files.map((file) => file.path)).toEqual(expect.arrayContaining(['package.json', 'src/main.vue', 'db/schema.sql', 'scripts/deploy.sh']));
     expect(repository.files.some((file) => file.path.includes('node_modules'))).toBe(false);
-    expect(mock.calls.some((url) => url.includes('/git/trees/0123456789abcdef'))).toBe(true);
+    expect(mock.calls.some((url) => url.includes('/git/commits/0123456789abcdef'))).toBe(true);
+    expect(mock.calls.some((url) => url.includes('/git/trees/abcdefabcdef'))).toBe(true);
   });
 
   it('rejects private repositories even when an authenticated token can read them', async () => {
@@ -71,5 +74,10 @@ describe('GitHub repository inspection', () => {
   it('blocks repositories whose supported source set exceeds the bounded audit', async () => {
     const mock = mockGitHub(false, false, 81);
     await expect(new GitHubClient(undefined, mock.fetcher).inspect('acme/demo')).rejects.toThrow('supported file limit');
+  });
+
+  it('blocks oversized supported files instead of silently omitting them', async () => {
+    const mock = mockGitHub(false, false, 0, true);
+    await expect(new GitHubClient(undefined, mock.fetcher).inspect('acme/demo')).rejects.toThrow('supported file size');
   });
 });

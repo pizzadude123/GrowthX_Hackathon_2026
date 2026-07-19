@@ -1,46 +1,49 @@
-import { readFile, access } from 'node:fs/promises';
+import { createHash,createHmac,timingSafeEqual } from 'node:crypto';
+import { execFile } from 'node:child_process';
+import { readFile,access } from 'node:fs/promises';
 import { resolve } from 'node:path';
+import { promisify } from 'node:util';
+import { canonicalStringify } from '../packages/core/src/canonical-integrity.js';
 
-const required = ['WHITEBOX_CONTROL_PLANE_URL', 'WHITEBOX_COMMAND_TOKEN', 'WHITEBOX_WORKER_TOKEN', 'PUBLIC_APP_URL'];
-const missing = required.filter((name) => !process.env[name]);
-const prompt = await readFile('hermes/WHITEBOX_POC_SYSTEM_PROMPT.md', 'utf8');
-const worker = await readFile('scripts/whitebox-worker.ts', 'utf8');
-const resultContract = await readFile('packages/core/src/hermes-result.ts', 'utf8');
-
-async function reachable(url: string) {
-  try {
-    const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function installedPluginMatches() {
-  const home = process.env.HERMES_HOME;
-  if (!home) return true;
-  const installed = resolve(home, 'plugins/whitebox-agency/__init__.py');
-  try {
-    await access(installed);
-    return await readFile(installed, 'utf8') === await readFile('hermes/plugins/whitebox-agency/__init__.py', 'utf8');
-  } catch {
-    return false;
-  }
-}
-
-const repairEnabled = process.env.WHITEBOX_ENABLE_GUARDED_REPAIR === 'true';
-const checks = {
-  promptVersion: prompt.includes('Whitebox POC Audit Manager') && prompt.includes('whitebox-verified-result-v1'),
-  immutableCommitContract: prompt.includes('40-character commit SHA') && resultContract.includes('Hermes result commit'),
-  failClosedFallback: worker.includes('demoteUnverifiedAnalysis') && worker.includes("resultStatus: structuredResultAccepted"),
-  noMockHermes: !prompt.includes('MockHermes'),
-  requiredEnvironment: missing.length === 0,
-  scopedCredentials: Boolean(process.env.WHITEBOX_COMMAND_TOKEN && process.env.WHITEBOX_WORKER_TOKEN && process.env.WHITEBOX_COMMAND_TOKEN !== process.env.WHITEBOX_WORKER_TOKEN),
-  repairModeSafe: !repairEnabled || Boolean(process.env.GITHUB_TOKEN && process.env.GITHUB_REPAIR_ALLOWLIST),
-  hermesGatewayHealthy: await reachable(process.env.HERMES_RUNS_URL ?? 'http://127.0.0.1:8742/health'),
-  publicAppHealthy: process.env.PUBLIC_APP_URL ? await reachable(`${process.env.PUBLIC_APP_URL.replace(/\/$/, '')}/dashboard`) : false,
-  installedPluginParity: await installedPluginMatches(),
+const execFileAsync=promisify(execFile);
+const required=['WHITEBOX_CONTROL_PLANE_URL','WHITEBOX_COMMAND_TOKEN','WHITEBOX_WORKER_TOKEN','WHITEBOX_DELIVERY_TOKEN','WHITEBOX_DELIVERY_SIGNER_TOKEN','WHITEBOX_RELEASE_TOKEN','WHITEBOX_RELEASE_TREE_SHA','WHITEBOX_HERMES_PROXY_TOKEN','HERMES_SERVER_KEY','HERMES_SERVER_URL','HERMES_HOME','HERMES_AGENT_ROOT','WHITEBOX_HERMES_COMMIT','WHITEBOX_HERMES_RECEIPT_KEY','WHITEBOX_HERMES_RUNTIME_KEY','PUBLIC_APP_URL','WHITEBOX_EXPECTED_CONVEX_URL','WHITEBOX_VERIFY_RUN_ID'];
+const missing=required.filter(name=>!process.env[name]);
+const [prompt,auditorPrompt]=await Promise.all([readFile('hermes/WHITEBOX_POC_SYSTEM_PROMPT.md','utf8'),readFile('hermes/WHITEBOX_AUDITOR_SYSTEM_PROMPT.md','utf8')]);
+async function releaseSourceDigest(){try{const tree=process.env.WHITEBOX_RELEASE_TREE_SHA!,identityPaths=['packages/core/src/release-identity.ts','apps/web/src/release-identity.ts'];const [{stdout},...identities]=await Promise.all([execFileAsync('git',['ls-tree','-rz','--full-tree',tree],{maxBuffer:5_000_000}),...identityPaths.map(path=>execFileAsync('git',['show',`${tree}:${path}`],{maxBuffer:100_000}))]);const entries=stdout.split('\0').filter(Boolean).map(entry=>{const match=/^(\d+) \w+ ([a-f0-9]{40})\t(.+)$/.exec(entry);if(!match)throw new Error('invalid tree entry');return{mode:match[1]!,blobSha:match[2]!,path:match[3]!};}).filter(entry=>!identityPaths.includes(entry.path)).sort((left,right)=>left.path.localeCompare(right.path)),digest=createHash('sha256').update(JSON.stringify({version:'whitebox-release-source-v1',entries}),'utf8').digest('hex');return identities.every(({stdout:identity})=>/WHITEBOX_RELEASE_SOURCE_DIGEST='([a-f0-9]{64})'/.exec(identity)?.[1]===digest)?digest:'';}catch{return'';}}
+const expectedSourceDigest=await releaseSourceDigest();
+async function reachable(url:string,init?:RequestInit){try{return(await fetch(url,{...init,signal:AbortSignal.timeout(10_000)})).ok;}catch{return false;}}
+async function installedPluginMatches(){const home=process.env.HERMES_HOME;if(!home)return false;try{const installed=resolve(home,'plugins/whitebox-agency');await access(installed);const files=['__init__.py','plugin.yaml'];return (await Promise.all(files.map(async file=>await readFile(resolve(installed,file),'utf8')===await readFile(resolve('hermes/plugins/whitebox-agency',file),'utf8')))).every(Boolean);}catch{return false;}}
+async function noToolRuntime(){try{const{stdout}=await execFileAsync('python3',[resolve('scripts/install-hermes-runtime-gate.py'),process.env.HERMES_AGENT_ROOT!],{timeout:60_000,maxBuffer:100_000});return stdout.trim()==='whitebox_hermes_runtime_gate_verified';}catch{return false;}}
+async function authenticatedRuntimeReceipt(){try{const response=await fetch(`${process.env.HERMES_SERVER_URL!.replace(/\/$/,'')}/whitebox/runtime`,{headers:{Authorization:'Be'+'arer '+process.env.WHITEBOX_HERMES_PROXY_TOKEN},signal:AbortSignal.timeout(10_000)});if(!response.ok)return false;const{receipt,signature}=await response.json() as {receipt:Record<string,unknown>;signature:string};const expected=createHmac('sha256',process.env.WHITEBOX_HERMES_RECEIPT_KEY!).update(canonicalStringify(receipt),'utf8').digest('hex');const left=Buffer.from(signature),right=Buffer.from(expected);return left.length===right.length&&timingSafeEqual(left,right)&&receipt.version==='whitebox-hermes-runtime-v1'&&receipt.releaseSourceDigest===expectedSourceDigest&&receipt.runScopedGate===true&&receipt.signerAvailable===true&&receipt.runtimeLockVersion==='whitebox-hermes-runtime-lock-v1'&&receipt.upstreamOrigin==='http://127.0.0.1:8742'&&typeof receipt.runtimeProcessPid==='number'&&Number.isInteger(receipt.runtimeProcessPid)&&receipt.runtimeProcessPid>0;}catch{return false;}}
+async function semanticContracts(){try{const{stdout}=await execFileAsync('npx',['tsx','scripts/verify-security-contracts.ts'],{timeout:120_000,maxBuffer:200_000});return (JSON.parse(stdout.slice(stdout.indexOf('{'))) as{checks:Record<string,boolean>}).checks;}catch{return{} as Record<string,boolean>;}}
+async function scopedCredentialRejection(){try{const base=process.env.WHITEBOX_CONTROL_PLANE_URL!.replace(/\/$/,'');const results=await Promise.all(['/api/worker/lease','/api/runs/start','/api/delivery/claim','/api/release/evidence','/api/runtime/producer-authority/consume'].map(path=>fetch(`${base}${path}`,{method:'POST',headers:{Authorization:'Bearer intentionally-invalid-scope','Content-Type':'application/json'},body:'{}',redirect:'error',signal:AbortSignal.timeout(10_000)})));return results.every(response=>response.status===401);}catch{return false;}}
+async function exactRunEvidence(){try{const base=process.env.WHITEBOX_CONTROL_PLANE_URL!.replace(/\/$/,''),expectedTreeSha=process.env.WHITEBOX_RELEASE_TREE_SHA!.toLowerCase();if(!expectedSourceDigest)return false;const response=await fetch(`${base}/api/release/evidence`,{method:'POST',headers:{Authorization:'Be'+'arer '+process.env.WHITEBOX_RELEASE_TOKEN,'Content-Type':'application/json'},body:JSON.stringify({publicId:process.env.WHITEBOX_VERIFY_RUN_ID,expectedTreeSha,expectedSourceDigest}),redirect:'error',signal:AbortSignal.timeout(15_000)});if(!response.ok)return false;const evidence=await response.json() as {version?:unknown;publicId?:unknown;releaseTreeSha?:unknown;releaseSourceDigest?:unknown;sourceCommitSha?:unknown;runtimeIdentityDigest?:unknown;checks?:Record<string,unknown>;passed?:unknown};return evidence.version==='whitebox-release-evidence-v2'&&evidence.publicId===process.env.WHITEBOX_VERIFY_RUN_ID&&evidence.releaseTreeSha===expectedTreeSha&&evidence.releaseSourceDigest===expectedSourceDigest&&typeof evidence.sourceCommitSha==='string'&&/^[a-f0-9]{40}$/.test(evidence.sourceCommitSha)&&typeof evidence.runtimeIdentityDigest==='string'&&/^[a-f0-9]{64}$/.test(evidence.runtimeIdentityDigest)&&evidence.passed===true&&Boolean(evidence.checks)&&Object.keys(evidence.checks??{}).length>=8&&Object.values(evidence.checks??{}).every(value=>value===true);}catch{return false;}}
+async function frontendBinding(){try{const base=process.env.PUBLIC_APP_URL!.replace(/\/$/,'');const html=await(await fetch(base,{signal:AbortSignal.timeout(10_000)})).text();const assets=[...html.matchAll(/(?:src|href)="([^"]+\.(?:js|css))"/g)].map(match=>new URL(match[1]!,base).href);const texts=await Promise.all(assets.map(async url=>await(await fetch(url)).text()));const all=[html,...texts].join('\n'),urls=[...new Set(all.match(/https:\/\/[a-z0-9-]+\.convex\.cloud/g)??[])];return Boolean(expectedSourceDigest)&&all.includes(expectedSourceDigest)&&urls.includes(process.env.WHITEBOX_EXPECTED_CONVEX_URL!)&&!urls.some(url=>url!==process.env.WHITEBOX_EXPECTED_CONVEX_URL&&url!=='https://happy-otter-123.convex.cloud');}catch{return false;}}
+const forbiddenKeys=new Set(['_id','_creationTime','telegramUserId','telegramChatId','telegramThreadId','hermesSessionId','hermesRunId','hermesVerifierRunId','snapshotManifest','snapshotDigest','resultDigest','roleProofDigest','deliveryReceiptDigest','error','deliveryError','inputSummary','outputSummary','tokenUse','costUsd']);
+function publicShapeSafe(value:unknown):boolean{if(Array.isArray(value))return value.every(publicShapeSafe);if(value&&typeof value==='object')return Object.entries(value as Record<string,unknown>).every(([key,child])=>!forbiddenKeys.has(key)&&publicShapeSafe(child));return typeof value!=='string'||(!value.includes('/Users/')&&!value.includes('/private/')&&!value.includes('telegram:'));}
+async function publicPrivacy(){try{const response=await fetch(`${process.env.WHITEBOX_EXPECTED_CONVEX_URL}/api/query`,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({path:'runs:getByPublicId',args:{publicId:process.env.WHITEBOX_VERIFY_RUN_ID},format:'json'}),signal:AbortSignal.timeout(15_000)});if(!response.ok)return false;const payload=await response.json() as {value?:unknown};return Boolean(payload.value)&&publicShapeSafe(payload.value);}catch{return false;}}
+const credentials=['WHITEBOX_COMMAND_TOKEN','WHITEBOX_WORKER_TOKEN','WHITEBOX_DELIVERY_TOKEN','WHITEBOX_DELIVERY_SIGNER_TOKEN','WHITEBOX_RELEASE_TOKEN','WHITEBOX_HERMES_PROXY_TOKEN','HERMES_SERVER_KEY','WHITEBOX_HERMES_RECEIPT_KEY','WHITEBOX_HERMES_RUNTIME_KEY'].map(name=>process.env[name]??'');
+const semanticSecurity=await semanticContracts(),allSemantic=Object.keys(semanticSecurity).length>=20&&Object.values(semanticSecurity).every(Boolean);
+const checks={
+ promptProtocols:prompt.includes('Whitebox POC Verification Lead')&&auditorPrompt.includes('whitebox-auditor-proposal-v1')&&prompt.includes('whitebox-verified-result-v1'),
+ immutableCommitContract:prompt.includes('40-character commit SHA')&&semanticSecurity.unsupportedBlobDisposition&&semanticSecurity.sourceCommitChangesSnapshotIdentity,
+ candidateReconciliation:semanticSecurity.candidateOmissionRejected&&semanticSecurity.inventedCandidateRejected&&semanticSecurity.trustedSemanticAuthority,
+ failClosedFallback:semanticSecurity.unrecognizedProducerCandidateRejected&&semanticSecurity.ambiguousProducerRetrySuppressed&&semanticSecurity.conflictingCompletionRejected,
+ producerAuthorityBinding:semanticSecurity.approvedPromptDigestsBound&&semanticSecurity.privateGoalOmitted,
+ lifecycleIntegrity:semanticSecurity.firstCompletionReachable&&semanticSecurity.exactCompletionReplayIdempotent&&semanticSecurity.terminalSnapshotReuseRejected,
+ destinationBoundDelivery:semanticSecurity.serverAuthoritativeDeliveryClaim&&semanticSecurity.destinationMismatchRejected&&semanticSecurity.deliveryReceiptConflictRejected&&semanticSecurity.ambiguousSendSuppressed,
+ canonicalClaimIntegrity:semanticSecurity.producerProseNotPublic&&semanticSecurity.dependencyClaimsRemainUnverified&&semanticSecurity.canonicalSchemaOmitsPrivateAndProducerProse,
+ requiredEnvironment:missing.length===0,
+ scopedCredentials:credentials.every(value=>value.length>=32)&&new Set(credentials).size===credentials.length,
+ repairModeSafe:semanticSecurity.repairAuthorityRejected&&allSemantic,
+ scopedCredentialRejection:await scopedCredentialRejection(),
+ effectiveHermesToolsEmpty:await noToolRuntime(),
+ authenticatedReceiptRuntime:await authenticatedRuntimeReceipt(),
+ exactRunReleaseEvidence:await exactRunEvidence(),
+ publicAppHealthy:process.env.PUBLIC_APP_URL?await reachable(process.env.PUBLIC_APP_URL):false,
+ frontendConvexBinding:await frontendBinding(),
+ publicPrivacyProjection:await publicPrivacy(),
+ installedPluginParity:await installedPluginMatches(),
 };
-
-console.log(JSON.stringify({ checks, missing }, null, 2));
-if (process.argv.includes('--strict') && !Object.values(checks).every(Boolean)) process.exit(1);
+console.log(JSON.stringify({checks,missing},null,2));
+if(!Object.values(checks).every(Boolean))process.exit(1);

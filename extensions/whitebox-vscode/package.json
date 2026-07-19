@@ -12,8 +12,7 @@
       { "command": "whitebox.refresh", "title": "Whitebox: Refresh Diagnostics" },
       { "command": "whitebox.openDashboard", "title": "Whitebox: Open Live Dashboard" },
       { "command": "whitebox.openFlow", "title": "Whitebox: Open Affected Flow" },
-      { "command": "whitebox.openEvidence", "title": "Whitebox: Open GitHub Evidence" },
-      { "command": "whitebox.requestRepair", "title": "Whitebox: Request Guarded Repair" }
+      { "command": "whitebox.openEvidence", "title": "Whitebox: Open GitHub Evidence" }
     ]
   },
   "devDependencies": { "@types/vscode": "^1.95.0" }

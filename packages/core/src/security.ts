@@ -1,5 +1,3 @@
-import type { RunMode } from './contracts.js';
-
 const SAFE_SEGMENT = /^[A-Za-z0-9_.-]+$/;
 export function parseGitHubRepository(input: string) {
   const trimmed = input.trim();
@@ -15,11 +13,7 @@ export function parseGitHubRepository(input: string) {
   const key = `${owner}/${name}`;
   return { owner, name, key, canonicalUrl: `https://github.com/${key}` };
 }
-export function resolveRunMode(repositoryKey: string, allowlist = ''): RunMode {
-  const normalized = repositoryKey.toLowerCase();
-  const entries = allowlist.split(',').map((value) => value.trim().toLowerCase()).filter(Boolean);
-  return entries.includes(normalized) ? 'guarded_repair' : 'audit_only';
-}
+
 export function sanitizeRelativePath(path: string) {
   const normalized = path.replaceAll('\\', '/');
   if (!normalized || normalized.startsWith('/') || normalized.includes('../') || normalized.includes('\0')) throw new Error('Unsafe repository path');
@@ -30,8 +24,4 @@ export function redactSecrets(value: string) {
     .replace(/(authorization\s*:\s*bearer\s+)[^\s]+/gi, '$1[REDACTED]')
     .replace(/\b(?:ghp_|github_pat_|sk-|xox[baprs]-)[A-Za-z0-9_-]{12,}\b/g, '[REDACTED]')
     .replace(/\b[a-f0-9]{48,}\b/gi, '[REDACTED]');
-}
-export function assertRepairBounds(files: string[], changedLines: number) {
-  if (files.length > 5 || changedLines > 250) throw new Error('Repair exceeds guarded policy');
-  files.forEach(sanitizeRelativePath);
 }

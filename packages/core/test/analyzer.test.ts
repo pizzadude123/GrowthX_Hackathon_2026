@@ -17,6 +17,11 @@ describe('polyglot deterministic analysis', () => {
     expect(manifest.files.every((file) => file.fingerprint.length === 64)).toBe(true);
   });
 
+  it('fails closed instead of dropping files beyond the analysis boundary', async () => {
+    const oversized = Array.from({ length: 61 }, (_, index) => ({ path: `src/file-${index}.ts`, content: 'export {};' }));
+    await expect(buildManifest(oversized)).rejects.toThrow('analysis boundary');
+  });
+
   it('builds evidence-backed flow, principle, finding, dependency blast radius and snapshot', async () => {
     const result = await analyzeRepository({ repositoryKey: 'acme/demo', files, goal: 'stabilize checkout' });
     const mismatch = result.findings.find((finding) => finding.category === 'configuration');
