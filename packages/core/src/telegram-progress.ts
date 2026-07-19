@@ -8,20 +8,19 @@ export type TelegramProgressInput = {
   mappedFiles?: number;
   flowCount?: number;
   findings?: number;
-  fixed?: number;
   elapsedMs?: number;
   detail?: string | undefined;
-  prUrl?: string | undefined;
+
 };
 
 const stageCopy: Record<TelegramProgressStage, { icon: string; title: string; next: string }> = {
   mapping: { icon: '🗺️', title: 'Repository loaded', next: 'Building the logistics schema and capability profile.' },
   auditing: { icon: '🔎', title: 'System mapped', next: 'Hermes specialists are auditing flows, dependencies, and evidence.' },
-  validating: { icon: '🧪', title: 'Independent validation', next: 'Checking findings and bounded repairs before publication.' },
+  validating: { icon: '🧪', title: 'Independent validation', next: 'Checking proposed findings against exact repository evidence.' },
   retrying: { icon: '🔄', title: 'Temporary failure; retry queued', next: 'Whitebox will resume automatically with the same run ID.' },
   completed: { icon: '✅', title: 'Run completed', next: 'The complete evidence result is delivered in Telegram.' },
-  blocked: { icon: '⚠️', title: 'Run could not complete', next: 'No unsafe change was applied.' },
-  cancelled: { icon: '⏹️', title: 'Run cancelled', next: 'Work stopped safely; no unverified change was published.' },
+  blocked: { icon: '⚠️', title: 'Run could not complete', next: 'No audit result was accepted.' },
+  cancelled: { icon: '⏹️', title: 'Run cancelled', next: 'The read-only audit stopped without an accepted result.' },
 };
 
 export function formatTelegramProgress(input: TelegramProgressInput): string {
@@ -30,10 +29,10 @@ export function formatTelegramProgress(input: TelegramProgressInput): string {
     input.mappedFiles === undefined ? undefined : `${input.mappedFiles} files`,
     input.flowCount === undefined ? undefined : `${input.flowCount} flows`,
     input.findings === undefined ? undefined : `${input.findings} findings`,
-    input.fixed === undefined ? undefined : `${input.fixed} fixed`,
+
   ].filter(Boolean).join(' · ');
   const seconds = input.elapsedMs === undefined ? undefined : `${Math.round(input.elapsedMs / 1000)}s elapsed`;
-  const message = `${copy.icon} ${input.publicId} · ${copy.title}\n\nRepo: ${input.repository}${metrics ? `\n${metrics}` : ''}${seconds ? `\n${seconds}` : ''}${input.detail ? `\n\nCause: ${input.detail}` : ''}\n\n${copy.next}${input.prUrl ? `\nPR: ${input.prUrl}` : ''}${input.dashboardUrl ? `\nDashboard: ${input.dashboardUrl}` : ''}`;
+  const message = `${copy.icon} ${input.publicId} · ${copy.title}\n\nRepo: ${input.repository}${metrics ? `\n${metrics}` : ''}${seconds ? `\n${seconds}` : ''}${input.detail ? `\n\nCause: ${input.detail}` : ''}\n\n${copy.next}${input.dashboardUrl ? `\nDashboard: ${input.dashboardUrl}` : ''}`;
   if (message.length > 700) throw new Error('Telegram progress message exceeds 700 characters');
   return message;
 }
@@ -59,11 +58,11 @@ export function formatTelegramAgentUpdate(input: TelegramAgentUpdateInput): stri
 }
 
 export type TelegramFinalResultInput = {
-  publicId: string; repository: string; mode: 'audit_only' | 'guarded_repair'; commitSha: string; elapsedMs: number;
+  publicId: string; repository: string; mode: 'audit_only'; commitSha: string; elapsedMs: number;
   mappedFiles: number; languages: string[]; flows: string[]; rejectedFindings: number;
   findings: Array<{ severity: string; title: string; evidence: string }>;
   dependencies: Array<{ packageName: string; classification: string }>;
-  agents: Array<{ role: string; status: string }>; evalPassed: number; evalTotal: number; prUrl?: string | undefined; dashboardUrl?: string | undefined; resultState?: 'verified' | 'partial';
+  agents: Array<{ role: string; status: string }>; dashboardUrl?: string | undefined; resultState?: 'verified' | 'partial';
 };
 
 export function formatTelegramFinalResult(input: TelegramFinalResultInput): string {
@@ -79,8 +78,8 @@ export function formatTelegramFinalResult(input: TelegramFinalResultInput): stri
     : '• No dependency risks persisted.';
   const flows = input.flows.length ? input.flows.slice(0, 6).map((name) => `• ${name}`).join('\n') : '• No operational flow persisted.';
   const outcome = verifiedResult
-    ? input.mode === 'audit_only' ? 'Read-only audit completed; no repository code was executed or changed.' : 'Guarded repair completed with independent validation.'
-    : 'The repository was mapped, but independent structured verification was incomplete. Candidates remain human-review items and no repair was published.';
-  const message = `${verifiedResult ? '✅' : '⚠️'} ${input.publicId} · ${verifiedResult ? 'Verified result' : 'Partial result'}\n\nRepo: ${input.repository}\nCommit: ${input.commitSha}\nMode: ${input.mode.replace('_', ' ')}\nElapsed: ${Math.round(input.elapsedMs / 1000)}s\n\nSUMMARY\n${input.mappedFiles} files · ${input.languages.join(', ') || 'content-only'}\n${input.flows.length} flows · ${input.findings.length} confirmed · ${input.rejectedFindings} rejected\nRun gates: ${input.evalPassed}/${input.evalTotal} passed\n\nAGENTS\n${agents}\n\nFLOWS\n${flows}\n\nFINDINGS\n${findings}\n\nDEPENDENCIES\n${dependencies}\n\nRESULT\n${outcome}${input.prUrl ? `\nPR: ${input.prUrl}` : ''}${input.dashboardUrl ? `\nDashboard: ${input.dashboardUrl}` : ''}`;
+    ? 'Read-only audit completed; no repository code was executed or changed.'
+    : 'The repository was mapped, but independent structured verification was incomplete. Candidates remain human-review items and no active finding was accepted.';
+  const message = `${verifiedResult ? '✅' : '⚠️'} ${input.publicId} · ${verifiedResult ? 'Verified result' : 'Partial result'}\n\nRepo: ${input.repository}\nCommit: ${input.commitSha}\nMode: ${input.mode.replace('_', ' ')}\nElapsed: ${Math.round(input.elapsedMs / 1000)}s\n\nSUMMARY\n${input.mappedFiles} files · ${input.languages.join(', ') || 'content-only'}\n${input.flows.length} flows · ${input.findings.length} confirmed · ${input.rejectedFindings} rejected\n\nAGENTS\n${agents}\n\nFLOWS\n${flows}\n\nFINDINGS\n${findings}\n\nDEPENDENCIES\n${dependencies}\n\nRESULT\n${outcome}${input.dashboardUrl ? `\nDashboard: ${input.dashboardUrl}` : ''}`;
   return message.length <= 3900 ? message : `${message.slice(0, 3897)}…`;
 }

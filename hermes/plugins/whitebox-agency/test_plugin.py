@@ -1,4 +1,5 @@
 import importlib.util
+import os
 import pathlib
 import unittest
 from unittest.mock import MagicMock, patch
@@ -24,6 +25,16 @@ class WhiteboxPluginTests(unittest.IsolatedAsyncioTestCase):
             plugin._control_sync('/api/runs/status', {'publicId': 'WB-ABC'})
         request = urlopen.call_args.args[0]
         self.assertEqual(request.get_header('Authorization'), f"Bearer {'c' * 40}")
+
+    @patch.object(plugin.urllib.request, 'urlopen')
+    def test_control_rejects_plain_http_before_sending_credentials(self, urlopen):
+        with patch.dict(plugin.os.environ, {
+            'WHITEBOX_CONTROL_PLANE_URL': 'http://control.example',
+            'WHITEBOX_COMMAND_TOKEN': 'c' * 40,
+        }, clear=True):
+            with self.assertRaisesRegex(RuntimeError, 'HTTPS'):
+                plugin._control_sync('/api/runs/status', {'publicId': 'WB-ABC'})
+        urlopen.assert_not_called()
 
     def test_accepts_url_or_owner_repo_with_optional_goal(self):
         self.assertEqual(
@@ -57,6 +68,33 @@ class WhiteboxPluginTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn('WB-ABC', message)
         self.assertIn('schema-1', message)
         control.assert_called_once_with('/api/repositories/memory', {'repository': 'acme/demo'})
+
+    def test_guide_explains_the_complete_audit_and_manual_remediation_flow(self):
+        message = plugin._guide('')
+        self.assertIn('/whitebox OWNER/REPO', message)
+        self.assertIn('/whitebox-status RUN-ID', message)
+        self.assertIn('/whitebox-next RUN-ID', message)
+        self.assertIn('does not edit repositories', message)
+        self.assertIn('Run Whitebox again', message)
+
+    @patch.object(plugin, '_control')
+    async def test_next_steps_returns_recommendations_without_claiming_write_authority(self, control):
+        control.return_value = {
+            'run': {'publicId': 'WB-ABC', 'repository': 'acme/demo', 'status': 'audit_only'},
+            'findings': [
+                {
+                    'status': 'confirmed',
+                    'severity': 'high',
+                    'title': 'Missing timeout',
+                    'recommendation': 'Add a bounded request timeout.',
+                }
+            ],
+        }
+        message = await plugin._next_steps('WB-ABC')
+        self.assertIn('Whitebox does not edit repositories', message)
+        self.assertIn('Add a bounded request timeout.', message)
+        self.assertIn('/whitebox acme/demo --goal "verify the remediation from WB-ABC"', message)
+        control.assert_called_once_with('/api/runs/status', {'publicId': 'WB-ABC'})
 
 
 if __name__ == '__main__':

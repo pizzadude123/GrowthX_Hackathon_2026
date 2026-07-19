@@ -13,6 +13,7 @@ jobs:
       - run: npm run typecheck
       - run: npm run lint
       - run: npm test
+      - run: npm run verify:security-contracts
       - run: python3 -m unittest discover -s hermes/plugins/whitebox-agency -p 'test_*.py' -v
       - run: npm run eval
       - run: npm run build

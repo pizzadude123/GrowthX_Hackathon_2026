@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseHermesAgentTelemetry } from '../src/agent-telemetry.js';
+import { assertIndependentHermesRuns, parseHermesAgentTelemetry } from '../src/agent-telemetry.js';
 import { formatTelegramAgentUpdate } from '../src/telegram-progress.js';
 
 const log = [
@@ -30,5 +30,11 @@ describe('Hermes agent telemetry', () => {
     expect(message).toContain('42 files · 3 flows · 2 confirmed · 1 rejected');
     expect(message).toContain('Commit: abcdef123456');
     expect(message.length).toBeLessThanOrEqual(1200);
+  });
+
+  it('requires distinct successful auditor and verifier runs', () => {
+    expect(assertIndependentHermesRuns({ runId: 'audit-1', status: 'completed' }, { runId: 'verify-1', status: 'succeeded' })).toMatchObject({ auditorRunId: 'audit-1', verifierRunId: 'verify-1' });
+    expect(() => assertIndependentHermesRuns({ runId: 'same', status: 'completed' }, { runId: 'same', status: 'completed' })).toThrow('distinct');
+    expect(() => assertIndependentHermesRuns({ runId: 'audit-1', status: 'failed' }, { runId: 'verify-1', status: 'completed' })).toThrow('successful');
   });
 });

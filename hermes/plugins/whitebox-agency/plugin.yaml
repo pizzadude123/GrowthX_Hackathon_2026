@@ -1,5 +1,5 @@
 name: whitebox-agency
-version: 1.1.0
+version: 1.3.0
 description: "Constrained Telegram command surface for the Whitebox Living Code Logistics agency."
 author: Whitebox
 requires_env:

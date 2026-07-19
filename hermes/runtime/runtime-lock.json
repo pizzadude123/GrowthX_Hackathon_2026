@@ -1,0 +1,22 @@
+{
+  "baseApiServerDigest": "d819f04f4f3a7d2c7f2d3b5befb13aa50dc0df7ca8416909f65f6d214e8c7b66",
+  "configSecurityDigest": "6c731c41761e8938e4c50e076bb7d11816ec19435a284a57beb60d152ee2ecd0",
+  "effectiveToolCount": 0,
+  "hermesCommit": "aac77f1686859c9386602b0a2880b06821ccb68d",
+  "model": "gpt-5.4-mini",
+  "patchedApiServerDigest": "222056f8e27b8bb817bed949693813084b999c3c9c49bc1a28a34456cc82ad31",
+  "profile": "whitebox",
+  "provider": "openai-codex",
+  "pythonDigest": "612bb6e55a95ea6eaf3c9693cf17fbf1a738408ad3bbfce988f712d7321d2c42",
+  "runtimeFiles": {
+    "agent/agent_init.py": "10aacdad0ab8bd206a2164785b8b1cf9edc9d6083d2ac9db4db9edbc76fb69f2",
+    "gateway/platforms/api_server.py": "222056f8e27b8bb817bed949693813084b999c3c9c49bc1a28a34456cc82ad31",
+    "gateway/run.py": "b3568046b0a91a2d9dfccd82ff05d83a51e75d9fa09a0e72b8cb3a30939885a1",
+    "gateway/whitebox_runtime.py": "6387cdebb3ad34b22e7cd5c54718d6367d3d3e4a09d5f9cf8ed8d05a06bc0a03",
+    "model_tools.py": "30a2dcb33685783935f66abef6839d06736c90196a89dd034c91c4e6eb65c2db",
+    "run_agent.py": "92cc09fa750f01c89b273dd3b619384a4658d6dc1066187641a97b2f75df7594",
+    "tools/registry.py": "fa154663d5da05a5e470422019a9281dd5f95d7f91e410397633cbfd7ba053d3"
+  },
+  "runtimeModuleDigest": "6387cdebb3ad34b22e7cd5c54718d6367d3d3e4a09d5f9cf8ed8d05a06bc0a03",
+  "version": "whitebox-hermes-runtime-lock-v1"
+}

@@ -1,0 +1,78 @@
+diff --git a/gateway/platforms/api_server.py b/gateway/platforms/api_server.py
+index 5ba09d6749..e1a020c7a7 100644
+--- a/gateway/platforms/api_server.py
++++ b/gateway/platforms/api_server.py
+@@ -4171,6 +4171,10 @@ class APIServerAdapter(BasePlatformAdapter):
+         if auth_err:
+             return auth_err
+ 
++        whitebox_runtime_nonce = request.headers.get("X-Whitebox-Runtime-Nonce", "")
++        if len(whitebox_runtime_nonce) != 64 or any(ch not in "0123456789abcdef" for ch in whitebox_runtime_nonce):
++            return web.json_response(_openai_error("Missing or invalid Whitebox runtime nonce"), status=400)
++
+         # Long-term memory scope header (see chat_completions for details).
+         gateway_session_key, key_err = self._parse_session_key_header(request)
+         if key_err is not None:
+@@ -4274,28 +4278,40 @@ class APIServerAdapter(BasePlatformAdapter):
+             except Exception:
+                 pass
+ 
++        # Per-client model routing for /v1/runs (see model_routes).
++        route = self._resolve_route(body.get("model"))
++
++        try:
++            agent = self._create_agent(
++                ephemeral_system_prompt=ephemeral_system_prompt,
++                session_id=session_id,
++                stream_delta_callback=_text_cb,
++                tool_progress_callback=event_cb,
++                gateway_session_key=gateway_session_key,
++                route=route,
++            )
++            from gateway.whitebox_runtime import attest_zero_tool_agent
++            runtime_envelope = attest_zero_tool_agent(agent, run_id, session_id, whitebox_runtime_nonce)
++        except Exception as exc:
++            logger.exception("[api_server] Whitebox run-scoped runtime gate rejected run %s", run_id)
++            self._run_streams.pop(run_id, None)
++            self._run_streams_created.pop(run_id, None)
++            self._run_approval_sessions.pop(run_id, None)
++            return web.json_response(_openai_error(_redact_api_error_text(exc)), status=503)
++
+         self._set_run_status(
+             run_id,
+             "queued",
+             created_at=created_at,
+             session_id=session_id,
+             model=body.get("model", self._model_name),
++            whitebox_runtime_attestation=runtime_envelope["attestation"],
++            whitebox_runtime_signature=runtime_envelope["signature"],
+         )
+ 
+-        # Per-client model routing for /v1/runs (see model_routes).
+-        route = self._resolve_route(body.get("model"))
+-
+         async def _run_and_close():
+             try:
+                 self._set_run_status(run_id, "running")
+-                agent = self._create_agent(
+-                    ephemeral_system_prompt=ephemeral_system_prompt,
+-                    session_id=session_id,
+-                    stream_delta_callback=_text_cb,
+-                    tool_progress_callback=event_cb,
+-                    gateway_session_key=gateway_session_key,
+-                    route=route,
+-                )
+                 self._active_run_agents[run_id] = agent
+ 
+                 def _approval_notify(approval_data: Dict[str, Any]) -> None:
+@@ -4471,7 +4487,9 @@ class APIServerAdapter(BasePlatformAdapter):
+             {"X-Hermes-Session-Key": gateway_session_key} if gateway_session_key else {}
+         )
+         return web.json_response(
+-            {"run_id": run_id, "status": "started"},
++            {"run_id": run_id, "status": "started", "session_id": session_id,
++             "whitebox_runtime_attestation": runtime_envelope["attestation"],
++             "whitebox_runtime_signature": runtime_envelope["signature"]},
+             status=202,
+             headers=response_headers,
+         )

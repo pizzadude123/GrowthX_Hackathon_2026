@@ -21,15 +21,15 @@ describe('Hermes worker policy', () => {
   });
 
   it('fails closed without strong worker credentials', () => {
-    expect(() => assertWorkerConfiguration({ controlPlaneUrl: '', workerToken: '', hermesKey: '' })).toThrow();
-    expect(() => assertWorkerConfiguration({ controlPlaneUrl: 'https://example.convex.site', workerToken: 'short', hermesKey: 'key' })).toThrow();
+    expect(() => assertWorkerConfiguration({ controlPlaneUrl: '', workerToken: '',hermesUrl:'',proxyToken:'' })).toThrow();
+    expect(() => assertWorkerConfiguration({ controlPlaneUrl: 'https://example.convex.site', workerToken: 'short',hermesUrl:'http://127.0.0.1:8742',proxyToken:'key' })).toThrow();
   });
 
   it('accepts a complete production worker configuration', () => {
-    expect(assertWorkerConfiguration({ controlPlaneUrl: 'https://example.convex.site/', workerToken: 'x'.repeat(32), hermesKey: 'hermes-key' })).toEqual({
+    expect(assertWorkerConfiguration({ controlPlaneUrl: 'https://example.convex.site/', workerToken: 'x'.repeat(32),hermesUrl:'http://127.0.0.1:8743',proxyToken:'p'.repeat(32) })).toEqual({
       controlPlaneUrl: 'https://example.convex.site',
       workerToken: 'x'.repeat(32),
-      hermesKey: 'hermes-key',
+      hermesUrl:'http://127.0.0.1:8743',proxyToken:'p'.repeat(32),
     });
   });
 

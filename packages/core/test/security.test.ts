@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { parseGitHubRepository, resolveRunMode, sanitizeRelativePath, redactSecrets } from '../src/security.js';
+import { parseGitHubRepository, sanitizeRelativePath, redactSecrets } from '../src/security.js';
 
 describe('repository security policy', () => {
   it('normalizes a GitHub settings URL or owner/repository to a repository identity', () => {
@@ -18,10 +18,6 @@ describe('repository security policy', () => {
     expect(() => sanitizeRelativePath('../secret')).toThrow();
   });
 
-  it('allows repairs only for exact allowlist entries', () => {
-    expect(resolveRunMode('acme/demo', 'acme/demo,acme/fork')).toBe('guarded_repair');
-    expect(resolveRunMode('acme/other', 'acme/demo,acme/fork')).toBe('audit_only');
-  });
 
   it('redacts likely credentials', () => {
     const output = redactSecrets('Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456');

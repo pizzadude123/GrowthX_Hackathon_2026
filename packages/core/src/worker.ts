@@ -1,7 +1,8 @@
 export type WorkerConfiguration = {
   controlPlaneUrl: string;
   workerToken: string;
-  hermesKey: string;
+  hermesUrl:string;
+  proxyToken: string;
 };
 
 const terminalStatuses = new Set(['completed', 'succeeded', 'failed', 'cancelled', 'canceled', 'stopped']);
@@ -39,8 +40,9 @@ export function assertWorkerConfiguration(config: WorkerConfiguration): WorkerCo
   const controlPlaneUrl = config.controlPlaneUrl.replace(/\/$/, '');
   if (!/^https:\/\//.test(controlPlaneUrl)) throw new Error('WHITEBOX_CONTROL_PLANE_URL must use HTTPS');
   if (config.workerToken.length < 32) throw new Error('WHITEBOX_WORKER_TOKEN must contain at least 32 characters');
-  if (!config.hermesKey) throw new Error('HERMES_SERVER_KEY is required');
-  return { ...config, controlPlaneUrl };
+  if (config.hermesUrl.replace(/\/$/,'')!=='http://127.0.0.1:8743')throw new Error('HERMES_SERVER_URL must use the dedicated loopback receipt proxy');
+  if(config.proxyToken.length<32||config.proxyToken===config.workerToken)throw new Error('WHITEBOX_HERMES_PROXY_TOKEN must be strong and distinct from the worker token');
+  return { ...config, controlPlaneUrl,hermesUrl:'http://127.0.0.1:8743' };
 }
 
 export function isTransientFailure(error: unknown): boolean {

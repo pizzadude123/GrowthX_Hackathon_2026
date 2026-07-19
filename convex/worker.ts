@@ -1,206 +1,107 @@
 import { internalMutation } from './_generated/server';
 import type { MutationCtx } from './_generated/server';
+import type { Id } from './_generated/dataModel';
 import { v } from 'convex/values';
 import { replaceCanonicalAnalysis } from './lib/persist_analysis';
-import { assertCompletionBinding } from './lib/completion_binding';
+import { assertCanonicalAnalysis, assertCanonicalSourceMetadata, canonicalDigest, canonicalStringify, gitBlobSha, sha256Text } from '../packages/core/src/canonical-integrity';
+import { assertTerminalMutationAllowed, completionReplay, deliveryLegTransition, expiredDeliveryDisposition } from './lib/attempt_lifecycle';
+import { analyzeRepository } from '../packages/core/src/analyzer';
+import { enforceAnalysisIntegrity } from '../packages/core/src/evidence-integrity';
+import { mergeHermesVerifiedResult, reconcileHermesReview } from '../packages/core/src/hermes-result';
+import { canonicalDeliveryArtifacts } from '../packages/core/src/canonical-artifacts';
+import { canonicalDeliveryClaim, deliveryLeaseProjection } from './lib/delivery_lifecycle';
+import { hermesAuditorRunInput,hermesVerifierRunInput,WHITEBOX_AUDITOR_PROMPT_DIGEST,WHITEBOX_VERIFIER_PROMPT_DIGEST } from '../packages/core/src/hermes-authority';
+import {WHITEBOX_RELEASE_SOURCE_DIGEST} from '../packages/core/src/release-identity';
+import {assertProducerAuthorityConsumable} from './lib/producer_authority';
 
-const leaseDurationMs = 90_000;
-const maxAttempts = 3;
+const leaseDurationMs=90_000, maxAttempts=3;
+const terminalRunStatuses=new Set(['audit_only','partial','completed','cancelled','blocked','failed']);
+const failureCode=v.union(v.literal('gateway_timeout'),v.literal('gateway_unavailable'),v.literal('invalid_receipt'),v.literal('artifact_unavailable'),v.literal('lease_lost'),v.literal('ambiguous_send'),v.literal('cancelled'),v.literal('unknown'));
+const receipt=v.object({version:v.literal('whitebox-hermes-receipt-v1'),runId:v.string(),sessionId:v.string(),status:v.string(),role:v.union(v.literal('auditor'),v.literal('verifier')),attemptId:v.string(),repositoryKey:v.string(),sourceCommitSha:v.string(),snapshotDigest:v.string(),coverageDigest:v.string(),releaseSourceDigest:v.string(),promptDigest:v.string(),inputDigest:v.string(),outputDigest:v.string(),structuredResultDigest:v.string(),toolCallCount:v.number(),effectiveToolCount:v.number(),runtimeProofDigest:v.string(),runtimeIdentityDigest:v.string(),runtimeProcessPid:v.number(),runtimeBootNonce:v.string(),upstreamOrigin:v.string(),issuedAt:v.number()});
+const producerRole=v.union(v.literal('auditor'),v.literal('verifier'));
+const producerAuthority=v.object({version:v.literal('whitebox-producer-authority-v1'),jobId:v.id('workerJobs'),runId:v.id('runs'),runPublicId:v.string(),attemptId:v.string(),leaseId:v.string(),role:producerRole,sessionId:v.string(),repositoryKey:v.string(),sourceCommitSha:v.string(),snapshotDigest:v.string(),coverageDigest:v.string(),nonce:v.string(),issuedAt:v.number(),expiresAt:v.number()});
 
-async function findAvailableJob(ctx: MutationCtx, now: number) {
-  const queued = await ctx.db.query('workerJobs').withIndex('by_status_available', (query) => query.eq('status', 'queued').lte('availableAt', now)).first();
-  if (queued) return queued;
-  return ctx.db.query('workerJobs').withIndex('by_status_available', (query) => query.eq('status', 'leased').lte('availableAt', now)).first();
+async function attemptById(ctx:MutationCtx,attemptId:string){return ctx.db.query('analysisAttempts').withIndex('by_attempt_id',q=>q.eq('attemptId',attemptId)).unique();}
+async function activeAttempt(ctx:MutationCtx,args:{jobId:Id<'workerJobs'>;attemptId:string;leaseId:string}){
+ const now=Date.now(), job=await ctx.db.get(args.jobId); if(!job||job.status!=='leased'||job.currentAttemptId!==args.attemptId||job.leaseId!==args.leaseId||(job.leaseExpiresAt??0)<=now)throw new Error('Active analysis lease is invalid');
+ const attempt=await attemptById(ctx,args.attemptId); if(!attempt||attempt.jobId!==job._id||attempt.runId!==job.runId||attempt.leaseId!==args.leaseId||attempt.leaseExpiresAt<=now||['completed','failed','aborted','expired'].includes(attempt.status))throw new Error('Active analysis attempt is invalid');
+ const run=await ctx.db.get(job.runId); if(!run)throw new Error('Run record disappeared'); return {job,attempt,run,now};
 }
+function analysisJob(run:any,job:any,attemptId:string,leaseId:string){return{kind:'analysis' as const,jobId:job._id,attemptId,runId:run._id,publicId:run.publicId,repoUrl:job.repoUrl,requestedSourceCommitSha:job.requestedSourceCommitSha,repository:run.repository,goal:run.goal,mode:run.mode,leaseId,telegramUserId:run.telegramUserId,telegramChatId:run.telegramChatId,telegramThreadId:run.telegramThreadId};}
+function deliveryJob(run:any,row:any,leaseId:string){return deliveryLeaseProjection({outboxId:String(row._id),runId:String(run._id),publicId:run.publicId,repository:run.repository,leaseId,messageStatus:row.messageStatus,attachmentStatus:row.attachmentStatus});}
 
-export const lease = internalMutation({
-  args: { workerId: v.string(), leaseId: v.string() },
-  handler: async (ctx, args) => {
-    const now = Date.now();
-    const existing = await ctx.db.query('workerJobs').withIndex('by_lease_id', (query) => query.eq('leaseId', args.leaseId)).unique();
-    if (existing?.status === 'leased' && existing.workerId === args.workerId) {
-      const run = await ctx.db.get(existing.runId);
-      if (!run) throw new Error('Run record disappeared');
-      return { jobId: existing._id, runId: run._id, publicId: run.publicId, repoUrl: existing.repoUrl, repository: run.repository, goal: run.goal, mode: run.mode, leaseId: args.leaseId, telegramUserId: run.telegramUserId, telegramChatId: run.telegramChatId, telegramThreadId: run.telegramThreadId };
-    }
-    const job = await findAvailableJob(ctx, now);
-    if (!job) return null;
-    const run = await ctx.db.get(job.runId);
-    if (!run || run.status === 'cancelled') {
-      await ctx.db.patch(job._id, { status: 'failed', error: 'Run was cancelled or removed', updatedAt: now });
-      return null;
-    }
-    if (job.attempts >= maxAttempts) {
-      await ctx.db.patch(job._id, { status: 'failed', error: 'Worker retry budget exhausted', updatedAt: now });
-      await ctx.db.patch(job.runId, { status: 'blocked', currentStage: 'blocked', error: 'Hermes worker retry budget exhausted', completedAt: now });
-      return null;
-    }
-    const expiresAt = now + leaseDurationMs;
-    await ctx.db.patch(job._id, { status: 'leased', workerId: args.workerId, leaseId: args.leaseId, attempts: job.attempts + 1, leasedAt: now, leaseExpiresAt: expiresAt, availableAt: expiresAt, updatedAt: now, error: undefined });
-    await ctx.db.patch(job.runId, { status: 'queued', currentStage: 'queued', error: undefined });
-    return { jobId: job._id, runId: run._id, publicId: run.publicId, repoUrl: job.repoUrl, repository: run.repository, goal: run.goal, mode: run.mode, leaseId: args.leaseId, telegramUserId: run.telegramUserId, telegramChatId: run.telegramChatId, telegramThreadId: run.telegramThreadId };
-  },
-});
+export const lease=internalMutation({args:{workerId:v.string(),leaseId:v.string()},handler:async(ctx,args)=>{
+ const now=Date.now();
+ const existingJob=await ctx.db.query('workerJobs').withIndex('by_lease_id',q=>q.eq('leaseId',args.leaseId)).unique();
+ if(existingJob?.status==='leased'&&existingJob.workerId===args.workerId&&existingJob.currentAttemptId){const run=await ctx.db.get(existingJob.runId);if(!run)throw new Error('Run record disappeared');return analysisJob(run,existingJob,existingJob.currentAttemptId,args.leaseId);}
+ const existingOutbox=await ctx.db.query('deliveryOutbox').withIndex('by_lease_id',q=>q.eq('leaseId',args.leaseId)).unique();
+ if(existingOutbox?.status==='leased'&&existingOutbox.workerId===args.workerId){const run=await ctx.db.get(existingOutbox.runId);if(!run)throw new Error('Run record disappeared');return deliveryJob(run,existingOutbox,args.leaseId);}
+ let job=await ctx.db.query('workerJobs').withIndex('by_status_available',q=>q.eq('status','queued').lte('availableAt',now)).first();
+ if(!job)job=await ctx.db.query('workerJobs').withIndex('by_status_available',q=>q.eq('status','leased').lte('availableAt',now)).first();
+ if(job){
+  const run=await ctx.db.get(job.runId); if(!run||run.status==='cancelled'){await ctx.db.patch(job._id,{status:'failed',error:'cancelled',updatedAt:now});return null;}
+  if(job.attempts>=maxAttempts){await ctx.db.patch(job._id,{status:'failed',error:'retry_budget_exhausted',updatedAt:now});if(!terminalRunStatuses.has(run.status))await ctx.db.patch(run._id,{status:'blocked',currentStage:'blocked',error:'Worker retry budget exhausted',completedAt:now,deliveryStatus:'not_requested'});return null;}
+  if(job.currentAttemptId){const old=await attemptById(ctx,job.currentAttemptId);if(old&&!['completed','failed','aborted','expired'].includes(old.status))await ctx.db.patch(old._id,{status:'expired',failureCode:'lease_lost',updatedAt:now});}
+  const ordinal=(job.analysisAttemptCount??0)+1, expiresAt=now+leaseDurationMs, attemptId=args.leaseId;
+  await ctx.db.insert('analysisAttempts',{runId:run._id,jobId:job._id,attemptId,ordinal,status:'leased',workerId:args.workerId,leaseId:args.leaseId,leaseExpiresAt:expiresAt,createdAt:now,updatedAt:now});
+  await ctx.db.patch(job._id,{status:'leased',attempts:job.attempts+1,analysisAttemptCount:ordinal,currentAttemptId:attemptId,workerId:args.workerId,leaseId:args.leaseId,leasedAt:now,leaseExpiresAt:expiresAt,availableAt:expiresAt,updatedAt:now,error:undefined});
+  await ctx.db.patch(run._id,{status:'queued',currentStage:'queued',error:undefined}); return analysisJob(run,{...job,_id:job._id},attemptId,args.leaseId);
+ }
+ let outbox=await ctx.db.query('deliveryOutbox').withIndex('by_status_available',q=>q.eq('status','pending').lte('availableAt',now)).first();
+ if(!outbox)outbox=await ctx.db.query('deliveryOutbox').withIndex('by_status_available',q=>q.eq('status','leased').lte('availableAt',now)).first();
+ if(!outbox)return null;
+ const run=await ctx.db.get(outbox.runId);if(!run)return null;
+ const expiredDisposition=expiredDeliveryDisposition(outbox.messageStatus,outbox.attachmentStatus);
+ if(outbox.status==='leased'&&expiredDisposition.terminal){await ctx.db.patch(outbox._id,{status:'failed',messageStatus:outbox.messageStatus==='sending'?'unknown':outbox.messageStatus,attachmentStatus:outbox.attachmentStatus==='sending'?'unknown':outbox.attachmentStatus,lastFailureCode:'ambiguous_send',updatedAt:now,completedAt:now});await ctx.db.patch(run._id,{deliveryStatus:'failed',deliveryError:'Delivery outcome was ambiguous; automatic resend was suppressed'});return null;}
+ if(outbox.deliveryAttemptCount>=maxAttempts){await ctx.db.patch(outbox._id,{status:'failed',lastFailureCode:'gateway_unavailable',updatedAt:now,completedAt:now});await ctx.db.patch(run._id,{deliveryStatus:'failed',deliveryError:'Telegram delivery retry budget exhausted'});return null;}
+ const expiresAt=now+leaseDurationMs;await ctx.db.patch(outbox._id,{status:'leased',workerId:args.workerId,leaseId:args.leaseId,leasedAt:now,leaseExpiresAt:expiresAt,availableAt:expiresAt,deliveryAttemptCount:outbox.deliveryAttemptCount+1,updatedAt:now,lastFailureCode:undefined});return deliveryJob(run,outbox,args.leaseId);
+}});
 
-export const snapshotBound = internalMutation({
-  args: {
-    jobId: v.id('workerJobs'), leaseId: v.string(), repositoryKey: v.string(),
-    sourceCommitSha: v.string(),
-  },
-  handler: async (ctx, args) => {
-    const job = await ctx.db.get(args.jobId);
-    if (!job || job.status !== 'leased' || job.leaseId !== args.leaseId) throw new Error('Worker lease is invalid');
-    const run = await ctx.db.get(job.runId);
-    if (!run || run.status === 'cancelled') throw new Error('Run was cancelled');
-    if (run.repository.toLowerCase() !== args.repositoryKey.toLowerCase()) throw new Error('Snapshot repository does not match the run');
-    if (!/^[a-f0-9]{40}$/i.test(args.sourceCommitSha)) throw new Error('Snapshot requires an immutable commit SHA');
-    if (run.sourceCommitSha && run.sourceCommitSha.toLowerCase() !== args.sourceCommitSha.toLowerCase()) throw new Error('Run is already bound to a different source commit');
-    await ctx.db.patch(job.runId, { sourceCommitSha: args.sourceCommitSha.toLowerCase(), sourceBoundAt: Date.now() });
-    return { ok: true };
-  },
-});
+export const snapshotBound=internalMutation({args:{jobId:v.id('workerJobs'),attemptId:v.string(),leaseId:v.string(),repositoryKey:v.string(),sourceCommitSha:v.string(),snapshotDigest:v.string(),snapshotFiles:v.array(v.object({path:v.string(),blobSha:v.string(),bytes:v.number()})),coverageDigest:v.string(),coverageDispositions:v.array(v.object({path:v.string(),reason:v.union(v.literal('excluded_generated_or_vendored'),v.literal('unsupported_file_type'))}))},handler:async(ctx,args)=>{const{attempt,run,job,now}=await activeAttempt(ctx,args);if(run.repository.toLowerCase()!==args.repositoryKey.toLowerCase()||!job.requestedSourceCommitSha||job.requestedSourceCommitSha.toLowerCase()!==args.sourceCommitSha.toLowerCase()||run.requestedSourceCommitSha?.toLowerCase()!==args.sourceCommitSha.toLowerCase())throw new Error('Snapshot repository or requested commit mismatch');if(!/^[a-f0-9]{40}$/i.test(args.sourceCommitSha)||!/^[a-f0-9]{64}$/i.test(args.snapshotDigest)||!/^[a-f0-9]{64}$/i.test(args.coverageDigest)||!args.snapshotFiles.length)throw new Error('Snapshot binding is invalid');if(attempt.status==='source_bound'){const same=attempt.sourceCommitSha===args.sourceCommitSha.toLowerCase()&&attempt.snapshotDigest===args.snapshotDigest.toLowerCase()&&attempt.coverageDigest===args.coverageDigest&&canonicalStringify(attempt.snapshotManifest)===canonicalStringify(args.snapshotFiles);if(!same)throw new Error('Snapshot binding is immutable');return{ok:true,idempotent:true,snapshotDigest:args.snapshotDigest.toLowerCase(),coverageDigest:args.coverageDigest};}if(attempt.status!=='leased')throw new Error('Snapshot can only be bound before producer start');await ctx.db.patch(attempt._id,{status:'source_bound',repositoryKey:args.repositoryKey,sourceCommitSha:args.sourceCommitSha.toLowerCase(),snapshotDigest:args.snapshotDigest.toLowerCase(),snapshotManifest:args.snapshotFiles,coverageDigest:args.coverageDigest,coverageDispositions:args.coverageDispositions,updatedAt:now});return{ok:true,snapshotDigest:args.snapshotDigest.toLowerCase(),coverageDigest:args.coverageDigest};}});
+export const issueProducerAuthority=internalMutation({args:{jobId:v.id('workerJobs'),attemptId:v.string(),leaseId:v.string(),role:producerRole},handler:async(ctx,args)=>{const{attempt,run,now}=await activeAttempt(ctx,args);if(!attempt.repositoryKey||!attempt.sourceCommitSha||!attempt.snapshotDigest||!attempt.coverageDigest)throw new Error('Producer authority requires a bound source');if(args.role==='auditor'&&attempt.status!=='source_bound')throw new Error('Auditor authority requires a source-bound attempt');if(args.role==='verifier'&&(attempt.status!=='auditor_started'||!attempt.auditorRunId))throw new Error('Verifier authority requires the bound auditor');const nonceKey=args.role==='auditor'?'auditorCreationNonce':'verifierCreationNonce',expiresKey=args.role==='auditor'?'auditorCreationExpiresAt':'verifierCreationExpiresAt',consumedKey=args.role==='auditor'?'auditorCreationConsumedAt':'verifierCreationConsumedAt';if(attempt[consumedKey])throw new Error('Producer authority is already consumed');const existingNonce=attempt[nonceKey],existingExpires=attempt[expiresKey];if(existingNonce||existingExpires)throw new Error('Producer authority is already issued');const nonce=crypto.randomUUID().replace(/-/g,''),issuedAt=now,expiresAt=Math.min(now+60_000,attempt.leaseExpiresAt);await ctx.db.patch(attempt._id,{[nonceKey]:nonce,[expiresKey]:expiresAt,updatedAt:now});return{version:'whitebox-producer-authority-v1' as const,jobId:args.jobId,runId:run._id,runPublicId:run.publicId,attemptId:args.attemptId,leaseId:args.leaseId,role:args.role,sessionId:`${run.publicId}-${args.role}-${args.attemptId}`,repositoryKey:attempt.repositoryKey,sourceCommitSha:attempt.sourceCommitSha,snapshotDigest:attempt.snapshotDigest,coverageDigest:attempt.coverageDigest,nonce,issuedAt,expiresAt};}});
+export const consumeProducerAuthority=internalMutation({args:{authority:producerAuthority},handler:async(ctx,{authority})=>{const{attempt,run,now}=await activeAttempt(ctx,{jobId:authority.jobId,attemptId:authority.attemptId,leaseId:authority.leaseId});if(authority.version!=='whitebox-producer-authority-v1'||authority.runId!==run._id||authority.runPublicId!==run.publicId||authority.sessionId!==`${run.publicId}-${authority.role}-${authority.attemptId}`||authority.repositoryKey!==attempt.repositoryKey||authority.sourceCommitSha!==attempt.sourceCommitSha||authority.snapshotDigest!==attempt.snapshotDigest||authority.coverageDigest!==attempt.coverageDigest)throw new Error('Producer authority binding is invalid');const nonce=authority.role==='auditor'?attempt.auditorCreationNonce:attempt.verifierCreationNonce,expires=authority.role==='auditor'?attempt.auditorCreationExpiresAt:attempt.verifierCreationExpiresAt,consumed=authority.role==='auditor'?attempt.auditorCreationConsumedAt:attempt.verifierCreationConsumedAt;assertProducerAuthorityConsumable(authority,{...(nonce?{nonce}:{}),...(expires?{expiresAt:expires}:{}),...(consumed?{consumedAt:consumed}:{})},now);if(authority.role==='auditor'&&attempt.status!=='source_bound')throw new Error('Auditor authority state is invalid');if(authority.role==='verifier'&&(attempt.status!=='auditor_started'||!attempt.auditorRunId))throw new Error('Verifier authority state is invalid');await ctx.db.patch(attempt._id,authority.role==='auditor'?{auditorCreationConsumedAt:now,updatedAt:now}:{verifierCreationConsumedAt:now,updatedAt:now});return{ok:true};}});
+export const started=internalMutation({args:{jobId:v.id('workerJobs'),attemptId:v.string(),leaseId:v.string(),hermesRunId:v.string(),hermesSessionId:v.string()},handler:async(ctx,args)=>{const{attempt,run,now}=await activeAttempt(ctx,args);if(!attempt.sourceCommitSha||!attempt.auditorCreationConsumedAt)throw new Error('Source and auditor creation authority must be bound first');if(args.hermesSessionId!==`${run.publicId}-auditor-${args.attemptId}`)throw new Error('Auditor session binding mismatch');if(attempt.auditorRunId&&attempt.auditorRunId!==args.hermesRunId)throw new Error('Auditor producer conflict');if(attempt.auditorRunId===args.hermesRunId)return{ok:true,idempotent:true};await ctx.db.patch(attempt._id,{status:'auditor_started',auditorRunId:args.hermesRunId,auditorSessionId:args.hermesSessionId,updatedAt:now});await ctx.db.patch(run._id,{status:'mapping',currentStage:'mapping',startedAt:run.startedAt??now,hermesRunId:args.hermesRunId});await ctx.db.insert('agentSteps',{runId:run._id,analysisAttemptId:args.attemptId,stepId:args.hermesRunId,role:'Repository Auditor',dynamicallySpawned:false,objective:'Propose exact-evidence findings from the bounded immutable repository packet',status:'running',startedAt:now,inputSummary:'Bounded repository data',tools:[],revisions:[]});return{ok:true};}});
+export const verifierStarted=internalMutation({args:{jobId:v.id('workerJobs'),attemptId:v.string(),leaseId:v.string(),hermesRunId:v.string(),hermesSessionId:v.string()},handler:async(ctx,args)=>{const{attempt,run,now}=await activeAttempt(ctx,args);if(!attempt.auditorRunId||!attempt.verifierCreationConsumedAt||attempt.auditorRunId===args.hermesRunId)throw new Error('Distinct auditor and verifier creation authority must be bound first');if(args.hermesSessionId!==`${run.publicId}-verifier-${args.attemptId}`)throw new Error('Verifier session binding mismatch');if(attempt.verifierRunId&&attempt.verifierRunId!==args.hermesRunId)throw new Error('Verifier producer conflict');if(attempt.verifierRunId===args.hermesRunId)return{ok:true,idempotent:true};await ctx.db.patch(attempt._id,{status:'verifier_started',verifierRunId:args.hermesRunId,verifierSessionId:args.hermesSessionId,updatedAt:now});await ctx.db.patch(run._id,{hermesVerifierRunId:args.hermesRunId});await ctx.db.insert('agentSteps',{runId:run._id,analysisAttemptId:args.attemptId,parentStepId:attempt.auditorRunId,stepId:args.hermesRunId,role:'Verification Lead',dynamicallySpawned:false,objective:'Independently disposition every auditor proposal',status:'running',startedAt:now,inputSummary:'Auditor proposal and same bounded source',tools:[],revisions:[]});return{ok:true};}});
+export const heartbeat=internalMutation({args:{jobId:v.optional(v.id('workerJobs')),attemptId:v.optional(v.string()),outboxId:v.optional(v.id('deliveryOutbox')),leaseId:v.string()},handler:async(ctx,args)=>{const now=Date.now(),expiresAt=now+leaseDurationMs;if(args.outboxId){const row=await ctx.db.get(args.outboxId);if(!row||row.status!=='leased'||row.leaseId!==args.leaseId||(row.leaseExpiresAt??0)<=now)throw new Error('Delivery lease invalid');await ctx.db.patch(row._id,{leaseExpiresAt:expiresAt,availableAt:expiresAt,updatedAt:now});return{ok:true,leaseExpiresAt:expiresAt};}if(!args.jobId||!args.attemptId)throw new Error('Analysis attempt required');const{job,attempt}=await activeAttempt(ctx,{jobId:args.jobId,attemptId:args.attemptId,leaseId:args.leaseId});await ctx.db.patch(job._id,{leaseExpiresAt:expiresAt,availableAt:expiresAt,updatedAt:now});await ctx.db.patch(attempt._id,{leaseExpiresAt:expiresAt,updatedAt:now});return{ok:true,leaseExpiresAt:expiresAt};}});
+export const state=internalMutation({args:{jobId:v.id('workerJobs'),attemptId:v.string(),leaseId:v.string()},handler:async(ctx,args)=>{const{run}=await activeAttempt(ctx,args);return{status:run.status,paused:run.paused};}});
+export const stage=internalMutation({args:{jobId:v.id('workerJobs'),attemptId:v.string(),leaseId:v.string(),stage:v.union(v.literal('auditing'),v.literal('validating'))},handler:async(ctx,args)=>{const{attempt,run}=await activeAttempt(ctx,args);if(run.status==='cancelled'||terminalRunStatuses.has(run.status))throw new Error('Terminal run state is immutable');if(args.stage==='auditing'&&attempt.status!=='auditor_started')throw new Error('Auditing requires the bound auditor');if(args.stage==='validating'&&!['auditor_started','verifier_started'].includes(attempt.status))throw new Error('Validation requires a bound producer');const rank:Record<string,number>={accepted:0,queued:1,mapping:2,auditing:3,validating:4};if((rank[args.stage]??-1)<(rank[run.status]??-1))throw new Error('Run stage cannot regress');await ctx.db.patch(run._id,{status:args.stage,currentStage:args.stage});return{ok:true};}});
 
-export const started = internalMutation({
-  args: { jobId: v.id('workerJobs'), leaseId: v.string(), hermesRunId: v.string(), hermesSessionId: v.optional(v.string()) },
-  handler: async (ctx, args) => {
-    const job = await ctx.db.get(args.jobId);
-    if (!job || job.status !== 'leased' || job.leaseId !== args.leaseId) throw new Error('Worker lease is invalid');
-    const run = await ctx.db.get(job.runId);
-    if (!run || run.status === 'cancelled') throw new Error('Run was cancelled');
-    if (!run.sourceCommitSha) throw new Error('Source snapshot must be bound before Hermes starts');
-    const now = Date.now();
-    await ctx.db.patch(job.runId, { status: 'mapping', currentStage: 'mapping', startedAt: now, hermesRunId: args.hermesRunId, hermesSessionId: args.hermesSessionId });
-    await ctx.db.insert('agentSteps', { runId: job.runId, stepId: args.hermesRunId, role: 'Whitebox Manager Agent', dynamicallySpawned: false, objective: 'Coordinate the Living Code Logistics agency', status: 'running', startedAt: now, inputSummary: 'Telegram intake dispatched through the authenticated outbound Hermes worker', tools: ['Hermes Runs API', 'delegation'], revisions: [] });
-    return { ok: true };
-  },
-});
+export const complete=internalMutation({args:{jobId:v.id('workerJobs'),attemptId:v.string(),runId:v.id('runs'),leaseId:v.string(),repositoryKey:v.string(),sourceFiles:v.array(v.object({path:v.string(),content:v.string()})),sourceCommitSha:v.string(),hermesRunId:v.string(),hermesVerifierRunId:v.string(),auditorProposal:v.any(),verifierResult:v.any(),auditorReceipt:receipt,verifierReceipt:receipt,receiptsVerified:v.boolean(),releaseTreeSha:v.string(),releaseSourceDigest:v.string()},handler:async(ctx,args)=>{
+ const job=await ctx.db.get(args.jobId),attempt=await attemptById(ctx,args.attemptId);if(!job||!attempt||attempt.jobId!==job._id||attempt.runId!==args.runId)throw new Error('Completion attempt missing');const run=await ctx.db.get(job.runId);if(!run)throw new Error('Run missing');
+ const auditorResultDigest=await canonicalDigest(args.auditorProposal),verifierResultDigest=await canonicalDigest(args.verifierResult);if(run.status==='cancelled')throw new Error('Run cancelled');if(!args.receiptsVerified)throw new Error('Hermes receipts were not verified');if(!/^[a-f0-9]{40}$/i.test(args.releaseTreeSha)||args.releaseSourceDigest!==WHITEBOX_RELEASE_SOURCE_DIGEST)throw new Error('Release identity is invalid');
+ if(!attempt.sourceCommitSha||!attempt.snapshotDigest||!attempt.snapshotManifest||!attempt.coverageDigest||!attempt.coverageDispositions||attempt.repositoryKey?.toLowerCase()!==args.repositoryKey.toLowerCase()||attempt.sourceCommitSha!==args.sourceCommitSha.toLowerCase())throw new Error('Attempt source binding mismatch');
+ let analysis=enforceAnalysisIntegrity(await analyzeRepository({repositoryKey:run.repository,files:args.sourceFiles,goal:'audit_only',runId:run.publicId,dashboardUrl:`${process.env.PUBLIC_APP_URL??''}/runs/${run.publicId}`,analyzedAt:attempt.createdAt,sourceCommitSha:attempt.sourceCommitSha,coverageDigest:attempt.coverageDigest}),args.sourceFiles).analysis;
+ const expectedAuditorInputDigest=await sha256Text(await hermesAuditorRunInput(run.publicId,run.repository,attempt.sourceCommitSha,attempt.snapshotDigest,attempt.coverageDigest,args.sourceFiles,analysis.findings)),expectedVerifierInputDigest=await sha256Text(await hermesVerifierRunInput(run.publicId,run.repository,attempt.sourceCommitSha,attempt.snapshotDigest,attempt.coverageDigest,args.sourceFiles,args.auditorProposal as never,analysis.findings));
+ for(const [role,value,runId,sessionId,digest,promptDigest,inputDigest]of [['auditor',args.auditorReceipt,args.hermesRunId,attempt.auditorSessionId,auditorResultDigest,WHITEBOX_AUDITOR_PROMPT_DIGEST,expectedAuditorInputDigest],['verifier',args.verifierReceipt,args.hermesVerifierRunId,attempt.verifierSessionId,verifierResultDigest,WHITEBOX_VERIFIER_PROMPT_DIGEST,expectedVerifierInputDigest]] as const){if(value.role!==role||value.attemptId!==args.attemptId||value.runId!==runId||value.sessionId!==sessionId||value.repositoryKey.toLowerCase()!==args.repositoryKey.toLowerCase()||value.sourceCommitSha!==attempt.sourceCommitSha||value.snapshotDigest!==attempt.snapshotDigest||value.coverageDigest!==attempt.coverageDigest||value.releaseSourceDigest!==args.releaseSourceDigest||value.promptDigest!==promptDigest||value.inputDigest!==inputDigest||value.structuredResultDigest!==digest||(!attempt.completionDigest&&(value.issuedAt<attempt.createdAt||value.issuedAt>Date.now()+30_000||Date.now()-value.issuedAt>30*60_000))||value.toolCallCount!==0||value.effectiveToolCount!==0||!/^[a-f0-9]{64}$/i.test(value.runtimeProofDigest)||!/^[a-f0-9]{64}$/i.test(value.runtimeIdentityDigest)||value.upstreamOrigin!=='http://127.0.0.1:8742'||!['completed','succeeded'].includes(value.status))throw new Error('Hermes receipt binding failed');}
+ if(args.auditorReceipt.runtimeProofDigest===args.verifierReceipt.runtimeProofDigest||args.auditorReceipt.runtimeIdentityDigest!==args.verifierReceipt.runtimeIdentityDigest||args.auditorReceipt.runtimeProcessPid!==args.verifierReceipt.runtimeProcessPid||args.auditorReceipt.runtimeBootNonce!==args.verifierReceipt.runtimeBootNonce||attempt.auditorRunId!==args.hermesRunId||attempt.verifierRunId!==args.hermesVerifierRunId||args.hermesRunId===args.hermesVerifierRunId)throw new Error('Producer or runtime binding mismatch');
+ const sourceManifest=await Promise.all(args.sourceFiles.map(async file=>({path:file.path,blobSha:await gitBlobSha(file.content),bytes:new TextEncoder().encode(file.content).byteLength})));sourceManifest.sort((a,b)=>a.path.localeCompare(b.path));const bound=[...attempt.snapshotManifest].sort((a,b)=>a.path.localeCompare(b.path));if(canonicalStringify(sourceManifest)!==canonicalStringify(bound))throw new Error('Source bytes do not match bound blobs');
+ if(await canonicalDigest({repositoryKey:run.repository,sourceCommitSha:attempt.sourceCommitSha,files:bound,coverageDigest:attempt.coverageDigest})!==attempt.snapshotDigest)throw new Error('Snapshot digest mismatch');
+ const reconciled=reconcileHermesReview(args.auditorProposal,args.verifierResult);if(!reconciled.result||reconciled.errors.length)throw new Error('Signed Hermes envelopes do not reconcile');
+ const merged=await mergeHermesVerifiedResult(analysis,args.sourceFiles,reconciled.result);if(merged.errors.length)throw new Error('Signed Hermes result cannot be merged into trusted analysis');analysis=merged.analysis;analysis.snapshot.confidenceSummary=`${analysis.manifest.capability.deepSemantic?'Deep-semantic signals available':'Baseline analysis'}; ${analysis.findings.filter(finding=>finding.status==='confirmed').length} confirmed findings.`;
+ assertCanonicalAnalysis(analysis,args.sourceFiles);await assertCanonicalSourceMetadata(analysis,args.sourceFiles);const resultDigest=await canonicalDigest(analysis),now=attempt.completedAt??Date.now(),elapsedMs=Math.max(0,now-(run.startedAt??run.createdAt));const artifacts=canonicalDeliveryArtifacts({publicId:run.publicId,repository:run.repository,mode:'audit_only',dashboardUrl:`${process.env.PUBLIC_APP_URL??''}/runs/${run.publicId}`,sourceCommitSha:attempt.sourceCommitSha,elapsedMs},analysis);if(artifacts.attachmentBase64.length>900_000)throw new Error('Canonical delivery artifact exceeds bounds');const messageDigest=await sha256Text(artifacts.messageText),attachmentDigest=await sha256Text(artifacts.attachmentBase64),auditorReceiptDigest=await canonicalDigest(args.auditorReceipt),verifierReceiptDigest=await canonicalDigest(args.verifierReceipt),identity=await canonicalDigest({runId:String(args.runId),attemptId:args.attemptId,releaseTreeSha:args.releaseTreeSha.toLowerCase(),releaseSourceDigest:args.releaseSourceDigest,repositoryKey:args.repositoryKey,sourceCommitSha:args.sourceCommitSha,snapshotDigest:attempt.snapshotDigest,coverageDigest:attempt.coverageDigest,sourceManifest,auditorRunId:args.hermesRunId,auditorSessionId:attempt.auditorSessionId,auditorResultDigest,auditorReceiptDigest,verifierRunId:args.hermesVerifierRunId,verifierSessionId:attempt.verifierSessionId,verifierResultDigest,verifierReceiptDigest,resultDigest,messageDigest,attachmentDigest,protocolVersion:'whitebox-verified-result-v1'});
+ if(completionReplay(attempt.completionDigest,identity)==='replay')return{ok:true,idempotent:true,completionDigest:attempt.completionDigest,status:attempt.resultStatus,confirmedFindingCount:run.confirmedFindingCount};
+ await activeAttempt(ctx,args);
+ const summary=await replaceCanonicalAnalysis(ctx,{runId:run._id,repositoryKey:args.repositoryKey,sourceCommitSha:attempt.sourceCommitSha,analysis}),roleProofDigest=await canonicalDigest({auditorReceipt:args.auditorReceipt,verifierReceipt:args.verifierReceipt});
 
-export const heartbeat = internalMutation({
-  args: { jobId: v.id('workerJobs'), leaseId: v.string() },
-  handler: async (ctx, args) => {
-    const job = await ctx.db.get(args.jobId);
-    if (!job || job.status !== 'leased' || job.leaseId !== args.leaseId) throw new Error('Worker lease is invalid');
-    const now = Date.now();
-    const expiresAt = now + leaseDurationMs;
-    await ctx.db.patch(job._id, { leaseExpiresAt: expiresAt, availableAt: expiresAt, updatedAt: now });
-    return { ok: true, leaseExpiresAt: expiresAt };
-  },
-});
+ await ctx.db.patch(attempt._id,{status:'completed',auditorResultDigest,auditorReceiptDigest,verifierResultDigest,verifierReceiptDigest,releaseSourceDigest:args.releaseSourceDigest,runtimeIdentityDigest:args.auditorReceipt.runtimeIdentityDigest,runtimeProcessPid:args.auditorReceipt.runtimeProcessPid,runtimeBootNonce:args.auditorReceipt.runtimeBootNonce,completionDigest:identity,resultDigest,resultStatus:'audit_only',updatedAt:now,completedAt:now});await ctx.db.patch(job._id,{status:'completed',updatedAt:now,availableAt:now});
+ if(run.telegramChatId){const target=`telegram:${run.telegramChatId}${Number(run.telegramThreadId)>1?`:${Number(run.telegramThreadId)}`:''}`;await ctx.db.insert('deliveryOutbox',{runId:run._id,analysisAttemptId:args.attemptId,completionDigest:identity,target,status:'pending',messageText:artifacts.messageText,messageDigest,attachmentBase64:artifacts.attachmentBase64,attachmentName:artifacts.attachmentName,attachmentMediaType:'application/pdf',attachmentDigest,messageStatus:'pending',attachmentStatus:'pending',deliveryAttemptCount:0,availableAt:now,createdAt:now,updatedAt:now});}
+ await ctx.db.patch(run._id,{status:'audit_only',currentStage:'audit_only',hermesRunId:args.hermesRunId,hermesVerifierRunId:args.hermesVerifierRunId,releaseTreeSha:args.releaseTreeSha.toLowerCase(),releaseSourceDigest:args.releaseSourceDigest,runtimeIdentityDigest:args.auditorReceipt.runtimeIdentityDigest,runtimeProcessPid:args.auditorReceipt.runtimeProcessPid,runtimeBootNonce:args.auditorReceipt.runtimeBootNonce,sourceCommitSha:attempt.sourceCommitSha,snapshotDigest:attempt.snapshotDigest,snapshotManifest:attempt.snapshotManifest,sourceBoundAt:now,mappedFiles:summary.mappedFiles,flowCount:summary.flowCount,confirmedFindingCount:summary.confirmedFindingCount,rejectedFindingCount:summary.rejectedFindingCount,dependencyRiskCount:summary.dependencyRiskCount,outputSchemaSnapshotId:summary.outputSchemaSnapshotId,capabilityProfile:summary.capabilityProfile,completedAt:now,elapsedMs,error:undefined,resultProtocolVersion:'whitebox-verified-result-v1',resultDigest,roleProofDigest,deliveryStatus:run.telegramChatId?'pending':'not_requested',deliveryError:undefined});
+ const steps=await ctx.db.query('agentSteps').withIndex('by_run',q=>q.eq('runId',run._id)).collect();for(const step of steps.filter(row=>row.analysisAttemptId===args.attemptId))await ctx.db.patch(step._id,{status:'completed',finishedAt:now,latencyMs:now-step.startedAt});return{ok:true,status:'audit_only',completionDigest:identity,confirmedFindingCount:summary.confirmedFindingCount};
+}});
 
-export const state = internalMutation({
-  args: { jobId: v.id('workerJobs'), leaseId: v.string() },
-  handler: async (ctx, args) => {
-    const job = await ctx.db.get(args.jobId);
-    if (!job || job.status !== 'leased' || job.leaseId !== args.leaseId) throw new Error('Worker lease is invalid');
-    const run = await ctx.db.get(job.runId);
-    if (!run) throw new Error('Run record disappeared');
-    return { status: run.status, paused: run.paused };
-  },
-});
+const deliveryReceipt=v.object({version:v.literal('whitebox-delivery-receipt-v1'),outboxId:v.string(),leaseId:v.string(),leg:v.union(v.literal('message'),v.literal('attachment')),artifactDigest:v.string(),target:v.string(),platform:v.literal('telegram'),platformReceiptId:v.string(),issuedAt:v.number()});
+export const claimDeliveryLeg=internalMutation({args:{outboxId:v.id('deliveryOutbox'),leaseId:v.string(),leg:v.union(v.literal('message'),v.literal('attachment'))},handler:async(ctx,args)=>{
+ const now=Date.now(),row=await ctx.db.get(args.outboxId);if(!row||row.status!=='leased'||row.leaseId!==args.leaseId||(row.leaseExpiresAt??0)<=now)throw new Error('Delivery lease invalid');const run=await ctx.db.get(row.runId);if(!run||run.status==='cancelled'||!run.telegramChatId)throw new Error('Delivery destination unavailable');
+ const claim=canonicalDeliveryClaim(row,args.leg),statusKey=args.leg==='message'?'messageStatus':'attachmentStatus',current=row[statusKey],existing=args.leg==='message'?row.messagePlatformReceiptId:row.attachmentPlatformReceiptId;
+ deliveryLegTransition(current,'sending',existing,undefined);await ctx.db.patch(row._id,{[statusKey]:'sending',updatedAt:now});return claim;
+}});
+export const deliveryLeg=internalMutation({args:{outboxId:v.id('deliveryOutbox'),leaseId:v.string(),leg:v.union(v.literal('message'),v.literal('attachment')),status:v.literal('delivered'),deliveryReceipt:v.optional(deliveryReceipt),receiptVerified:v.optional(v.boolean())},handler:async(ctx,args)=>{
+ const now=Date.now(),row=await ctx.db.get(args.outboxId);if(!row||row.status!=='leased'||row.leaseId!==args.leaseId||(row.leaseExpiresAt??0)<=now)throw new Error('Delivery lease invalid');const run=await ctx.db.get(row.runId);if(!run||run.status==='cancelled')throw new Error('Cancelled delivery cannot mutate');
+ const statusKey=args.leg==='message'?'messageStatus':'attachmentStatus',current=row[statusKey],existing=args.leg==='message'?row.messagePlatformReceiptId:row.attachmentPlatformReceiptId;
 
-export const stage = internalMutation({
-  args: { jobId: v.id('workerJobs'), leaseId: v.string(), stage: v.string() },
-  handler: async (ctx, args) => {
-    const job = await ctx.db.get(args.jobId);
-    if (!job || job.status !== 'leased' || job.leaseId !== args.leaseId) throw new Error('Worker lease is invalid');
-    const run = await ctx.db.get(job.runId);
-    if (!run || run.status === 'cancelled') throw new Error('Run was cancelled');
-    await ctx.db.patch(job.runId, { status: args.stage, currentStage: args.stage });
-    return { ok: true };
-  },
-});
-
-export const complete = internalMutation({
-  args: {
-    jobId: v.id('workerJobs'), runId: v.id('runs'), leaseId: v.string(), repositoryKey: v.string(), analysis: v.any(),
-    sourceCommitSha: v.string(), hermesRunId: v.string(), protocolVersion: v.string(), resultDigest: v.string(),
-    hermesStatus: v.string(), hermesOutputSummary: v.optional(v.string()), resultStatus: v.union(v.literal('audit_only'), v.literal('partial'), v.literal('completed')),
-    elapsedMs: v.number(), verifiedRepairCount: v.number(), revertedRepairCount: v.number(), prUrl: v.optional(v.string()), agentSteps: v.array(v.any()),
-  },
-  handler: async (ctx, args) => {
-    const job = await ctx.db.get(args.jobId);
-    if (job?.status === 'completed' && job.leaseId === args.leaseId) return { ok: true, idempotent: true };
-    if (!job) throw new Error('Worker lease is invalid');
-    const run = await ctx.db.get(job.runId);
-    if (!run) throw new Error('Run record disappeared');
-    assertCompletionBinding(run, job, args);
-    if (!/^[a-f0-9]{64}$/i.test(args.resultDigest)) throw new Error('Completion requires a canonical SHA-256 digest');
-    if (run.status === 'cancelled') throw new Error('Run was cancelled');
-    if (!['completed','succeeded'].includes(args.hermesStatus.toLowerCase())) throw new Error(`Hermes result is not successful: ${args.hermesStatus}`);
-    if (run.mode === 'audit_only' && args.resultStatus === 'completed') throw new Error('Audit-only runs cannot claim a repair completion');
-    if (args.resultStatus === 'completed' && !args.prUrl) throw new Error('Completed repair runs require a real PR URL');
-
-    const summary = await replaceCanonicalAnalysis(ctx, args);
-    const now = Date.now();
-    await ctx.db.patch(job._id, { status: 'completed', updatedAt: now, availableAt: now });
-    await ctx.db.patch(job.runId, {
-      status: args.resultStatus, currentStage: args.resultStatus,
-      mappedFiles: summary.mappedFiles, flowCount: summary.flowCount,
-      confirmedFindingCount: summary.confirmedFindingCount, rejectedFindingCount: summary.rejectedFindingCount,
-      dependencyRiskCount: summary.dependencyRiskCount, outputSchemaSnapshotId: summary.outputSchemaSnapshotId,
-      capabilityProfile: summary.capabilityProfile, verifiedRepairCount: args.verifiedRepairCount,
-      revertedRepairCount: args.revertedRepairCount, completedAt: now, elapsedMs: args.elapsedMs,
-      prUrl: args.prUrl, error: undefined, resultProtocolVersion: args.protocolVersion,
-      resultDigest: args.resultDigest.toLowerCase(),
-      deliveryStatus: run.telegramChatId ? 'pending' : 'not_requested', deliveryError: undefined,
-    });
-    for (const step of args.agentSteps) await ctx.db.insert('agentSteps', { runId: job.runId, parentStepId: run.hermesRunId, ...step });
-    const steps = await ctx.db.query('agentSteps').withIndex('by_run', (query) => query.eq('runId', job.runId)).collect();
-    const manager = steps.find((step) => step.stepId === run.hermesRunId);
-    if (manager) await ctx.db.patch(manager._id, { status: 'completed', finishedAt: now, latencyMs: now - manager.startedAt, outputSummary: args.hermesOutputSummary });
-    return { ok: true, status: args.resultStatus, confirmedFindingCount: summary.confirmedFindingCount };
-  },
-});
-
-export const delivery = internalMutation({
-  args: {
-    jobId: v.id('workerJobs'), leaseId: v.string(),
-    status: v.union(v.literal('delivered'), v.literal('failed')),
-    telegramMessageId: v.optional(v.number()), pdfMessageId: v.optional(v.number()), error: v.optional(v.string()),
-  },
-  handler: async (ctx, args) => {
-    const job = await ctx.db.get(args.jobId);
-    if (!job || job.leaseId !== args.leaseId || job.status !== 'completed') throw new Error('Completed worker lease is invalid');
-    if (args.status === 'delivered' && args.error) throw new Error('Delivered receipts cannot include an error');
-    if (args.status === 'failed' && !args.error) throw new Error('Failed delivery requires an error receipt');
-    await ctx.db.patch(job.runId, {
-      deliveryStatus: args.status,
-      deliveryError: args.status === 'failed' ? args.error?.slice(0, 500) : undefined,
-      telegramMessageId: args.telegramMessageId,
-      pdfMessageId: args.pdfMessageId,
-    });
-    return { ok: true };
-  },
-});
-
-export const abort = internalMutation({
-  args: { jobId: v.id('workerJobs'), leaseId: v.string(), reason: v.string() },
-  handler: async (ctx, args) => {
-    const job = await ctx.db.get(args.jobId);
-    if (!job || job.leaseId !== args.leaseId) throw new Error('Worker lease is invalid');
-    const now = Date.now();
-    await ctx.db.patch(job._id, { status: 'failed', error: args.reason, updatedAt: now, availableAt: now });
-    const run = await ctx.db.get(job.runId);
-    if (run && run.status !== 'cancelled') await ctx.db.patch(job.runId, { status: 'blocked', currentStage: 'blocked', error: args.reason, completedAt: now });
-    return { ok: true };
-  },
-});
-
-export const fail = internalMutation({
-  args: { jobId: v.id('workerJobs'), leaseId: v.string(), error: v.string(), retryable: v.boolean() },
-  handler: async (ctx, args) => {
-    const job = await ctx.db.get(args.jobId);
-    if (!job || job.status !== 'leased' || job.leaseId !== args.leaseId) throw new Error('Worker lease is invalid');
-    const now = Date.now();
-    if (args.retryable && job.attempts < maxAttempts) {
-      const retryAt = now + Math.min(60_000, 2_000 * 2 ** Math.max(0, job.attempts - 1));
-      await ctx.db.patch(job._id, { status: 'queued', error: args.error, availableAt: retryAt, updatedAt: now, leaseId: undefined, workerId: undefined, leaseExpiresAt: undefined });
-      await ctx.db.patch(job.runId, { status: 'queued', currentStage: 'queued', error: `Temporary failure; retry ${job.attempts + 1}/${maxAttempts} queued` });
-      return { ok: true, terminal: false, retryAt };
-    }
-    await ctx.db.patch(job._id, { status: 'failed', error: args.error, updatedAt: now, availableAt: now });
-    await ctx.db.patch(job.runId, { status: 'blocked', currentStage: 'blocked', error: args.error, completedAt: now });
-    await ctx.db.insert('evalCases', { caseId: `production-${String(job.runId)}`, name: 'Promoted production worker failure', version: 'runtime-v1', expected: { failure: args.error, promotedAt: now } });
-    return { ok: true, terminal: true };
-  },
-});
+ const receipt=args.deliveryReceipt,expectedDigest=args.leg==='message'?row.messageDigest:row.attachmentDigest;if(args.receiptVerified!==true||!receipt||receipt.outboxId!==String(row._id)||receipt.leaseId!==args.leaseId||receipt.leg!==args.leg||receipt.artifactDigest!==expectedDigest||receipt.target!==row.target||!/^[1-9]\d*$/.test(receipt.platformReceiptId))throw new Error('Authenticated destination-bound positive platform receipt required');const receiptDigest=await canonicalDigest(receipt);const transition=deliveryLegTransition(current,args.status,existing,receipt.platformReceiptId);if(transition==='replay')return{ok:true,idempotent:true};
+ const patch=args.leg==='message'?{messageStatus:'delivered' as const,messagePlatformReceiptId:receipt.platformReceiptId,messageReceiptDigest:receiptDigest,updatedAt:now}:{attachmentStatus:'delivered' as const,attachmentPlatformReceiptId:receipt.platformReceiptId,attachmentReceiptDigest:receiptDigest,updatedAt:now};await ctx.db.patch(row._id,patch);const other=args.leg==='message'?row.attachmentStatus:row.messageStatus;if(other==='delivered'){await ctx.db.patch(row._id,{status:'delivered',completedAt:now,updatedAt:now});await ctx.db.patch(row.runId,{deliveryStatus:'delivered',deliveryError:undefined});}return{ok:true};
+}});
+export const deliveryFailed=internalMutation({args:{outboxId:v.id('deliveryOutbox'),leaseId:v.string(),code:failureCode},handler:async(ctx,args)=>{const now=Date.now(),row=await ctx.db.get(args.outboxId);if(!row||row.status!=='leased'||row.leaseId!==args.leaseId||(row.leaseExpiresAt??0)<=now)throw new Error('Delivery lease invalid');const ambiguous=row.messageStatus==='sending'||row.attachmentStatus==='sending'||args.code==='ambiguous_send';const retry=!ambiguous&&row.deliveryAttemptCount<maxAttempts;await ctx.db.patch(row._id,retry?{status:'pending',lastFailureCode:args.code,availableAt:now+Math.min(60_000,2_000*2**row.deliveryAttemptCount),leaseId:undefined,workerId:undefined,leaseExpiresAt:undefined,updatedAt:now}:{status:'failed',messageStatus:row.messageStatus==='sending'?'unknown':row.messageStatus,attachmentStatus:row.attachmentStatus==='sending'?'unknown':row.attachmentStatus,lastFailureCode:args.code,completedAt:now,updatedAt:now});await ctx.db.patch(row.runId,{deliveryStatus:retry?'pending':'failed',deliveryError:retry?undefined:'Telegram delivery stopped after a safe bounded failure'});return{ok:true,terminal:!retry};}});
+export const abort=internalMutation({args:{jobId:v.id('workerJobs'),attemptId:v.string(),leaseId:v.string(),code:failureCode},handler:async(ctx,args)=>{const{job,attempt,run,now}=await activeAttempt(ctx,args);if(run.status!=='cancelled')throw new Error('Abort requires authoritative cancellation');await ctx.db.patch(attempt._id,{status:'aborted',failureCode:args.code,updatedAt:now});await ctx.db.patch(job._id,{status:'failed',error:'cancelled',updatedAt:now});return{ok:true};}});
+export const fail=internalMutation({args:{jobId:v.id('workerJobs'),attemptId:v.string(),leaseId:v.string(),code:failureCode,retryable:v.boolean()},handler:async(ctx,args)=>{const{job,attempt,run,now}=await activeAttempt(ctx,args);assertTerminalMutationAllowed(run.status,attempt.completionDigest);await ctx.db.patch(attempt._id,{status:'failed',failureCode:args.code,updatedAt:now});if(args.retryable&&job.attempts<maxAttempts){const retryAt=now+Math.min(60_000,2_000*2**Math.max(0,job.attempts-1));await ctx.db.patch(job._id,{status:'queued',error:args.code,availableAt:retryAt,updatedAt:now,leaseId:undefined,workerId:undefined,leaseExpiresAt:undefined});await ctx.db.patch(run._id,{status:'queued',currentStage:'queued',error:'Temporary worker failure; bounded retry queued'});return{ok:true,terminal:false,retryAt};}await ctx.db.patch(job._id,{status:'failed',error:args.code,updatedAt:now});await ctx.db.patch(run._id,{status:'blocked',currentStage:'blocked',error:'Worker failed closed',completedAt:now,deliveryStatus:'not_requested'});return{ok:true,terminal:true};}});

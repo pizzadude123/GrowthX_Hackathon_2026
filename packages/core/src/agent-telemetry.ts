@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+
 export type HermesAgentTelemetry = {
   sessionId: string;
   role: string;
@@ -54,4 +56,14 @@ export function toAgentSteps(agents: HermesAgentTelemetry[]) {
     inputSummary: agent.objective, ...(agent.status === 'completed' ? { outputSummary: 'Hermes specialist returned its structured handoff.' } : {}),
     tools: ['Hermes delegated session'], revisions: [],
   }));
+}
+
+export function assertIndependentHermesRuns(auditor: { runId: string; status: string }, verifier: { runId: string; status: string }) {
+  if (auditor.runId === verifier.runId) throw new Error('Auditor and verifier Hermes runs must be distinct');
+  if (![auditor.status, verifier.status].every((status) => ['completed', 'succeeded'].includes(status.toLowerCase()))) throw new Error('Auditor and verifier Hermes runs must both be successful');
+  return {
+    auditorRunId: auditor.runId,
+    verifierRunId: verifier.runId,
+    proofDigest: createHash('sha256').update(`${auditor.runId}\n${auditor.status}\n${verifier.runId}\n${verifier.status}`).digest('hex'),
+  };
 }

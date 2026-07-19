@@ -1,22 +1,12 @@
-# Hermes Proof
+# Hermes proof
 
-Whitebox uses Hermes Agent v0.18.2's documented API Server, not an invented package or mock.
+A release-valid run requires direct, immutable evidence from both isolated Hermes roles.
 
-## Interface
+1. Confirm raw Hermes is bound only to the dedicated loopback gateway and the signed receipt proxy is the worker endpoint.
+2. Verify the startup runtime receipt has a valid signature, a profile/config identity digest, an effective tool count of zero, and the expected upstream origin.
+3. Inspect the run's private attempt record: Repository Auditor and Verification Lead must have distinct run/session IDs bound to the same attempt and immutable source.
+4. Verify each signed terminal receipt binds the exact attempt, role, run, session, approved prompt digest, exact input digest, structured envelope digest, runtime proof, and runtime identity.
+5. Confirm the trusted server independently reconciled every candidate/disposition, regenerated canonical analysis from frozen source bytes, and persisted only evidence-backed findings.
+6. Confirm delivery used the durable outbox and both destination-bound signed receipts contain positive Telegram platform IDs.
 
-- `POST /v1/runs` creates a real asynchronous Hermes run.
-- `GET /v1/runs/{run_id}` returns terminal status, output, session ID, and usage when supplied.
-- `GET /v1/runs/{run_id}/events` is the SSE progress surface.
-- `POST /v1/runs/{run_id}/stop` cancels at a safe interruption point.
-- Bearer authentication is read from server-only `HERMES_SERVER_KEY` by Whitebox. The Hermes gateway itself is configured with its native `API_SERVER_KEY`; operators rotate/map the same secret without exposing it to the browser.
-
-## Judge verification
-
-1. Send `/whitebox https://github.com/OWNER/REPO --goal "stabilize checkout"` to the configured Hermes Telegram chat.
-2. Open the returned `/runs/WB-*` route.
-3. Confirm the header contains a non-placeholder Hermes run/session ID returned by `/v1/runs`.
-4. Open **Agent Trace** and compare task IDs/statuses with Hermes `/v1/runs/{id}/events` or the Hermes session store.
-5. Confirm tool summaries correspond to persisted GitHub retrieval, schema construction, repair, validation, and publication records.
-6. Inspect the final Telegram delivery and verify every URL resolves.
-
-Production orchestration throws when `HERMES_SERVER_KEY` is absent. There is no production mock adapter. Cost is displayed only if Hermes returns it.
+Shared gateway logs, prompt text, worker assertions, stale runs, or screenshots alone are not proof.
