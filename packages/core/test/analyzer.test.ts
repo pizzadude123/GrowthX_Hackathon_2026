@@ -28,6 +28,17 @@ describe('polyglot deterministic analysis', () => {
     expect(result.snapshot.version).toBe(1);
   });
 
+  it('ignores fetch-like prose and generated metadata as runtime HTTP calls', async () => {
+    const metadataFiles = [
+      { path: 'pnpm-lock.yaml', content: 'fetching-package: https://registry.example.test/archive.tgz' },
+      { path: 'README.md', content: 'The service is fetching analyses from an API.' },
+      { path: 'src/log.ts', content: 'console.error("Error fetching analyses", error);' },
+    ];
+    const result = await analyzeRepository({ repositoryKey: 'acme/metadata', files: metadataFiles, goal: 'reliability' });
+    expect(result.findings.some((finding) => finding.title.includes('Outbound call'))).toBe(false);
+    expect(result.nodes.some((node) => node.kind === 'external_api')).toBe(false);
+  });
+
   it('rejects an unsupported timeout claim when a timeout is present', async () => {
     const safeFiles = [{ path: 'src/api.ts', content: "fetch(url, { signal: AbortSignal.timeout(5000) });" }];
     const result = await analyzeRepository({ repositoryKey: 'acme/safe', files: safeFiles, goal: 'reliability' });

@@ -516,6 +516,52 @@ Before marking a run completed, verify:
 
 If a required condition fails, mark the run `partial`, `audit_only`, or `blocked`. Never disguise it as completed.
 
+## Machine-readable verified result
+
+Every completed audit must write `verified-result.json` at the exact run-scoped path supplied by the manager task. This artifact is the handoff from independent verification to the deterministic Whitebox runtime. It must be valid JSON with this bounded contract:
+
+```json
+{
+  "version": "whitebox-verified-result-v1",
+  "repository": "owner/repository",
+  "sourceCommitSha": "required exact 40-character commit SHA supplied by the manager task",
+  "summary": "concise factual independent-verification summary",
+  "findings": [
+    {
+      "title": "short finding title",
+      "category": "state_flow|integration|dependency|data_consistency|validation|async_failure|configuration|authentication|reliability",
+      "severity": "low|medium|high|critical",
+      "confidence": 0.0,
+      "status": "confirmed|probable|needs_human_review|rejected",
+      "impact": "specific operational impact",
+      "logicChain": ["ordered", "flow", "linkage"],
+      "evidence": [{
+        "path": "exact/relative/path",
+        "startLine": 1,
+        "endLine": 1,
+        "excerpt": "verbatim source text inside that exact range",
+        "explanation": "why this source proves or disproves the claim"
+      }],
+      "businessImpact": "specific consequence",
+      "recommendation": "bounded next action",
+      "repairability": "safe_automatic|guarded_automatic|human_required",
+      "rejectionReason": "required when rejected"
+    }
+  ]
+}
+```
+
+Rules:
+
+- Use the exact repository key and 40-character source commit SHA supplied for the run; both are mandatory and are checked against the immutable snapshot.
+- Include no more than 40 findings and no more than 12 evidence records per finding.
+- Confirmed findings require exact existing paths, positive in-range lines, and a verbatim excerpt contained within that range.
+- Never invent graph IDs; the deterministic runtime attaches canonical node, flow, and invariant IDs after source validation.
+- Include rejected candidates when they are useful evidence of independent challenge, with a concise rejection reason.
+- Write the artifact with the file tool, then read it back and correct malformed JSON before finishing.
+- Also include the same object in a final fenced `json` block so the worker has a transport fallback.
+- Do not place prose, Markdown comments, or trailing commas inside the JSON artifact.
+
 Own the complete job.
 
 Maintain the living schema, find where code violates its operational principles, coordinate the appropriate specialists, repair what can be proven safe, reject what cannot be supported, validate the result, publish the evidence, and communicate with precision.
