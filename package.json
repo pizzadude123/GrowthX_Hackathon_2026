@@ -16,7 +16,8 @@
     "test:watch": "vitest",
     "eval": "tsx scripts/run-evals.ts",
     "verify:production": "tsx scripts/verify-production.ts",
-    "secret-scan": "tsx scripts/secret-scan.ts"
+    "secret-scan": "tsx scripts/secret-scan.ts",
+    "worker": "tsx scripts/whitebox-worker.ts"
   },
   "dependencies": {
     "convex": "^1.31.7",

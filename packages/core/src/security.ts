@@ -2,8 +2,12 @@ import type { RunMode } from './contracts.js';
 
 const SAFE_SEGMENT = /^[A-Za-z0-9_.-]+$/;
 export function parseGitHubRepository(input: string) {
+  const trimmed = input.trim();
+  const normalized = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+(?:\.git)?$/.test(trimmed)
+    ? `https://github.com/${trimmed}`
+    : trimmed;
   let url: URL;
-  try { url = new URL(input); } catch { throw new Error('A valid GitHub URL is required'); }
+  try { url = new URL(normalized); } catch { throw new Error('A valid GitHub URL or owner/repository is required'); }
   if (url.protocol !== 'https:' || url.hostname.toLowerCase() !== 'github.com') throw new Error('Only https://github.com repositories are accepted');
   const [owner, rawName] = url.pathname.split('/').filter(Boolean);
   const name = rawName?.replace(/\.git$/, '');

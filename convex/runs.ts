@@ -1,8 +1,73 @@
-import { mutation, query } from './_generated/server'; import { v } from 'convex/values';
-export const listRecent=query({args:{},handler:async(ctx)=>ctx.db.query('runs').order('desc').take(20)});
-export const getByPublicId=query({args:{publicId:v.string()},handler:async(ctx,args)=>{const run=await ctx.db.query('runs').withIndex('by_public_id',q=>q.eq('publicId',args.publicId)).unique();if(!run)return null;const [steps,nodes,edges,flows,findings,dependencies,repairs,validations,diagnostics,deltas]=await Promise.all([ctx.db.query('agentSteps').withIndex('by_run',q=>q.eq('runId',run._id)).collect(),ctx.db.query('graphNodes').withIndex('by_run',q=>q.eq('runId',run._id)).collect(),ctx.db.query('graphEdges').withIndex('by_run',q=>q.eq('runId',run._id)).collect(),ctx.db.query('flows').withIndex('by_run',q=>q.eq('runId',run._id)).collect(),ctx.db.query('findings').withIndex('by_run',q=>q.eq('runId',run._id)).collect(),ctx.db.query('dependencies').withIndex('by_run',q=>q.eq('runId',run._id)).collect(),ctx.db.query('repairs').withIndex('by_run',q=>q.eq('runId',run._id)).collect(),ctx.db.query('validations').withIndex('by_run',q=>q.eq('runId',run._id)).collect(),ctx.db.query('editorDiagnostics').withIndex('by_run',q=>q.eq('runId',run._id)).collect(),ctx.db.query('schemaDeltas').withIndex('by_run',q=>q.eq('runId',run._id)).collect()]);return{run,steps,nodes,edges,flows,findings,dependencies,repairs,validations,diagnostics,deltas};}});
-export const create=mutation({args:{publicId:v.string(),repository:v.string(),owner:v.string(),name:v.string(),goal:v.string(),mode:v.union(v.literal('audit_only'),v.literal('guarded_repair')),dashboardSlug:v.string()},handler:async(ctx,args)=>ctx.db.insert('runs',{...args,status:'accepted',currentStage:'accepted',promptVersion:'whitebox-agency-v2-polyglot',createdAt:Date.now(),mappedFiles:0,flowCount:0,confirmedFindingCount:0,rejectedFindingCount:0,verifiedRepairCount:0,revertedRepairCount:0,dependencyRiskCount:0,analysisMode:'initial_full',changedFileCount:0,impactedFlowCount:0,paused:false,conservativeRepair:true})});
-export const patch=mutation({args:{runId:v.id('runs'),patch:v.any()},handler:async(ctx,args)=>ctx.db.patch(args.runId,args.patch)});
-export const persistAnalysis=mutation({args:{runId:v.id('runs'),repositoryKey:v.string(),analysis:v.any()},handler:async(ctx,args)=>{const a=args.analysis;for(const node of a.nodes)await ctx.db.insert('graphNodes',{runId:args.runId,nodeId:node.id,kind:node.kind,name:node.name,path:node.path,startLine:node.startLine,endLine:node.endLine,summary:node.summary,confidence:node.confidence});for(const edge of a.edges)await ctx.db.insert('graphEdges',{runId:args.runId,edgeId:edge.id,from:edge.from,to:edge.to,kind:edge.kind,evidence:edge.evidence,confidence:edge.confidence});for(const flow of a.flows)await ctx.db.insert('flows',{runId:args.runId,flowId:flow.id,name:flow.name,data:flow});for(const finding of a.findings)await ctx.db.insert('findings',{runId:args.runId,findingId:finding.id,...finding});for(const dependency of a.dependencies)await ctx.db.insert('dependencies',{runId:args.runId,packageName:dependency.packageName,data:dependency});for(const repair of a.repairs)await ctx.db.insert('repairs',{runId:args.runId,repairId:repair.id,findingId:repair.findingId,status:repair.status,data:repair});for(const validation of a.validations)await ctx.db.insert('validations',{runId:args.runId,repairId:validation.repairId,check:validation.check,status:validation.status,durationMs:validation.durationMs,summary:validation.summary,artifactUrl:validation.artifactUrl});for(const diagnostic of a.editorDiagnostics)await ctx.db.insert('editorDiagnostics',{runId:args.runId,repositoryKey:args.repositoryKey,...diagnostic});await ctx.db.insert('schemaSnapshots',{repositoryKey:args.repositoryKey,snapshotId:a.snapshot.id,version:a.snapshot.version,parentSnapshotId:a.snapshot.parentSnapshotId,sourceCommitSha:a.snapshot.sourceCommitSha,data:a.snapshot,createdAt:a.snapshot.createdAt,confidenceSummary:a.snapshot.confidenceSummary});await ctx.db.patch(args.runId,{status:'auditing',currentStage:'auditing',mappedFiles:a.manifest.files.length,flowCount:a.flows.length,confirmedFindingCount:a.findings.filter((f:any)=>f.status==='confirmed').length,rejectedFindingCount:a.findings.filter((f:any)=>f.status==='rejected').length,dependencyRiskCount:a.dependencies.length,outputSchemaSnapshotId:a.snapshot.id,capabilityProfile:a.manifest.capability});}});
+import { internalMutation, internalQuery, query } from './_generated/server';
+import { v } from 'convex/values';
+import { replaceCanonicalAnalysis } from './lib/persist_analysis';
 
-export const getByInternalId=query({args:{runId:v.id('runs')},handler:async(ctx,args)=>ctx.db.get(args.runId)});
+export const listRecent = query({
+  args: {},
+  handler: async (ctx) => (await ctx.db.query('runs').order('desc').take(50))
+    .filter((run) => !['blocked', 'cancelled', 'failed'].includes(run.status))
+    .slice(0, 10)
+    .map(publicRun),
+});
+
+export const getByPublicId = query({
+  args: { publicId: v.string() },
+  handler: async (ctx, args) => {
+    const run = await ctx.db.query('runs').withIndex('by_public_id', (q) => q.eq('publicId', args.publicId)).unique();
+    if (!run) return null;
+    const [steps, nodes, edges, flows, findings, dependencies, repairs, validations, diagnostics, deltas, schemaSnapshot, evalCases] = await Promise.all([
+      ctx.db.query('agentSteps').withIndex('by_run', (q) => q.eq('runId', run._id)).collect(),
+      ctx.db.query('graphNodes').withIndex('by_run', (q) => q.eq('runId', run._id)).collect(),
+      ctx.db.query('graphEdges').withIndex('by_run', (q) => q.eq('runId', run._id)).collect(),
+      ctx.db.query('flows').withIndex('by_run', (q) => q.eq('runId', run._id)).collect(),
+      ctx.db.query('findings').withIndex('by_run', (q) => q.eq('runId', run._id)).collect(),
+      ctx.db.query('dependencies').withIndex('by_run', (q) => q.eq('runId', run._id)).collect(),
+      ctx.db.query('repairs').withIndex('by_run', (q) => q.eq('runId', run._id)).collect(),
+      ctx.db.query('validations').withIndex('by_run', (q) => q.eq('runId', run._id)).collect(),
+      ctx.db.query('editorDiagnostics').withIndex('by_run', (q) => q.eq('runId', run._id)).collect(),
+      ctx.db.query('schemaDeltas').withIndex('by_run', (q) => q.eq('runId', run._id)).collect(),
+      run.outputSchemaSnapshotId ? ctx.db.query('schemaSnapshots').withIndex('by_snapshot_id', (q) => q.eq('snapshotId', run.outputSchemaSnapshotId!)).first() : null,
+      ctx.db.query('evalCases').collect(),
+    ]);
+    return { run: publicRun(run), steps, nodes, edges, flows, findings, dependencies, repairs, validations, diagnostics, deltas, schemaSnapshot, evalCases: evalCases.map(({ caseId, name, version }) => ({ caseId, name, version })) };
+  },
+});
+
+export const patch = internalMutation({
+  args: { runId: v.id('runs'), patch: v.any() },
+  handler: async (ctx, args) => ctx.db.patch(args.runId, args.patch),
+});
+
+export const persistAnalysis = internalMutation({
+  args: { runId: v.id('runs'), repositoryKey: v.string(), analysis: v.any() },
+  handler: async (ctx, args) => {
+    const summary = await replaceCanonicalAnalysis(ctx, args);
+    const terminal = ['completed','audit_only','partial','blocked','cancelled'].includes(summary.run.status);
+    await ctx.db.patch(args.runId, {
+      ...(terminal ? {} : { status: 'auditing', currentStage: 'auditing' }),
+      mappedFiles: summary.mappedFiles,
+      flowCount: summary.flowCount,
+      confirmedFindingCount: summary.confirmedFindingCount,
+      rejectedFindingCount: summary.rejectedFindingCount,
+      dependencyRiskCount: summary.dependencyRiskCount,
+      outputSchemaSnapshotId: summary.outputSchemaSnapshotId,
+      capabilityProfile: summary.capabilityProfile,
+    });
+    return { ok: true };
+  },
+});
+
+export const getByInternalId = internalQuery({ args: { runId: v.id('runs') }, handler: async (ctx, args) => ctx.db.get(args.runId) });
+export const getRunByPublicIdInternal = internalQuery({ args: { publicId: v.string() }, handler: async (ctx, args) => ctx.db.query('runs').withIndex('by_public_id', (q) => q.eq('publicId', args.publicId)).unique() });
+export const getLatestByRepositoryInternal = internalQuery({ args: { repository: v.string() }, handler: async (ctx, args) => ctx.db.query('runs').withIndex('by_repository', (q) => q.eq('repository', args.repository)).order('desc').first() });
+
+function publicRun<T extends Record<string, unknown>>(run: T) {
+  const safe: Record<string, unknown> = { ...run };
+  delete safe.telegramUserId;
+  delete safe.telegramChatId;
+  delete safe.telegramThreadId;
+  delete safe.telegramMessageId;
+  delete safe.pdfMessageId;
+  delete safe.userId;
+  return safe;
+}

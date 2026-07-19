@@ -1,0 +1,10 @@
+name: whitebox-agency
+version: 1.1.0
+description: "Constrained Telegram command surface for the Whitebox Living Code Logistics agency."
+author: Whitebox
+requires_env:
+  - name: WHITEBOX_CONTROL_PLANE_URL
+    description: "Hosted Convex HTTP actions URL"
+  - name: WHITEBOX_COMMAND_TOKEN
+    description: "Command-scoped control-plane bearer token"
+    password: true

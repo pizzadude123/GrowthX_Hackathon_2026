@@ -8,11 +8,15 @@
  * @module
  */
 
-import type * as actions_orchestrate from "../actions/orchestrate.js";
 import type * as http from "../http.js";
+import type * as lib_completion_binding from "../lib/completion_binding.js";
+import type * as lib_persist_analysis from "../lib/persist_analysis.js";
+import type * as lib_token_scope from "../lib/token_scope.js";
 import type * as management from "../management.js";
 import type * as runs from "../runs.js";
 import type * as start from "../start.js";
+import type * as waitlist from "../waitlist.js";
+import type * as worker from "../worker.js";
 
 import type {
   ApiFromModules,
@@ -21,11 +25,15 @@ import type {
 } from "convex/server";
 
 declare const fullApi: ApiFromModules<{
-  "actions/orchestrate": typeof actions_orchestrate;
   http: typeof http;
+  "lib/completion_binding": typeof lib_completion_binding;
+  "lib/persist_analysis": typeof lib_persist_analysis;
+  "lib/token_scope": typeof lib_token_scope;
   management: typeof management;
   runs: typeof runs;
   start: typeof start;
+  waitlist: typeof waitlist;
+  worker: typeof worker;
 }>;
 
 /**
